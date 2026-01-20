@@ -11,10 +11,10 @@ from dotenv import load_dotenv
 from aiogram import Bot, types
 from aiogram.client.session.aiohttp import AiohttpSession
 
-from database import Database
-from downloader import VideoDownloader
-from utils import get_platform
-from events import DownloadCompletedEvent
+from src.database.redis_db import Database
+from src.downloader.downloader import VideoDownloader
+from src.utils.utils import get_platform
+from src.events.events import DownloadCompletedEvent
 
 # Настройка логирования
 logging.basicConfig(

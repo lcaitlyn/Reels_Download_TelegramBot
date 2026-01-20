@@ -22,10 +22,10 @@ from aiogram.types import (
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 
-from database import Database
-from utils import normalize_url, get_platform, is_supported_url, get_video_id_fast, is_youtube_video
-from downloader import VideoDownloader
-from events import DownloadCompletedEvent, VideoViewClickedEvent
+from src.database.redis_db import Database
+from src.utils.utils import normalize_url, get_platform, is_supported_url, get_video_id_fast, is_youtube_video
+from src.downloader.downloader import VideoDownloader
+from src.events.events import DownloadCompletedEvent, VideoViewClickedEvent
 
 # Загрузка переменных окружения
 load_dotenv()

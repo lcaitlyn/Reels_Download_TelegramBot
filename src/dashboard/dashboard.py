@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Query
 
-from analytics_db import AnalyticsDB
+from src.database.analytics_db import AnalyticsDB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

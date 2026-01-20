@@ -9,9 +9,9 @@ import logging
 from typing import Optional
 from dotenv import load_dotenv
 
-from database import Database
-from analytics_db import AnalyticsDB
-from events import (
+from src.database.redis_db import Database
+from src.database.analytics_db import AnalyticsDB
+from src.events.events import (
     DownloadCompletedEvent,
     VideoViewClickedEvent,
     UserReferredEvent

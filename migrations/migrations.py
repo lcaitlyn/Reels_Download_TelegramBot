@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import asyncpg
-from analytics_db import AnalyticsDB
+from src.database.analytics_db import AnalyticsDB
 from dotenv import load_dotenv
 
 load_dotenv()

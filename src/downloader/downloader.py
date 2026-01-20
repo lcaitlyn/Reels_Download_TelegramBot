@@ -6,7 +6,7 @@ import logging
 import yt_dlp
 from typing import Optional
 
-from utils import get_platform
+from src.utils.utils import get_platform
 
 logger = logging.getLogger(__name__)
 

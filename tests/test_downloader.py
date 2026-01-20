@@ -7,8 +7,8 @@ from unittest.mock import Mock, patch, MagicMock
 import tempfile
 import shutil
 
-from downloader import VideoDownloader
-from utils import get_platform
+from src.downloader.downloader import VideoDownloader
+from src.utils.utils import get_platform
 
 
 class TestVideoDownloader(unittest.TestCase):
