@@ -3,6 +3,7 @@ Background Worker для обработки задач на скачивание
 Работает как отдельный процесс, слушает очередь задач и скачивает видео
 """
 import os
+import io
 import asyncio
 import logging
 from typing import Optional
@@ -13,6 +14,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from database import Database
 from downloader import VideoDownloader
 from utils import get_platform
+from events import DownloadCompletedEvent
 
 # Настройка логирования
 logging.basicConfig(
@@ -66,40 +68,77 @@ async def process_download_task(task: dict) -> Optional[int]:
         logger.error(f"[worker] Невалидная задача: {task}")
         return None
     
-    # Пытаемся получить lock на скачивание
-    got_lock = await db.acquire_download_lock(video_id)
+    # Извлекаем качество и format_id из задачи
+    quality = task.get('quality')
+    format_id = task.get('format_id')
+    
+    # Пытаемся получить lock на скачивание (с учетом качества)
+    got_lock = await db.acquire_download_lock(video_id, quality=quality)
     
     if not got_lock:
         # Lock не получен - кто-то уже скачивает, не обрабатываем задачу повторно
-        logger.info(f"[worker] Lock занят для video_id={video_id}, пропускаем задачу (кто-то уже скачивает)")
+        logger.info(f"[worker] Lock занят для video_id={video_id}, quality={quality}, пропускаем задачу (кто-то уже скачивает)")
         return None
     
     try:
         # Проверяем кэш еще раз (на случай если пока ждали lock, видео уже скачали)
-        cached_message_id = await db.get_cached_message_id(video_id=video_id)
+        # Если указано качество, проверяем кэш для этого качества
+        cached_message_id = await db.get_cached_message_id(video_id=video_id, quality=quality)
         if cached_message_id and cached_message_id != 0:
-            logger.info(f"[worker] Видео уже в кэше: video_id={video_id}, message_id={cached_message_id}")
+            logger.info(f"[worker] Видео уже в кэше: video_id={video_id}, quality={quality}, message_id={cached_message_id}")
             return cached_message_id
         
-        # Скачиваем видео
-        logger.info(f"[worker] Начало скачивания: url={url}, video_id={video_id}")
-        video_path = downloader.download_video(url)
+        # Скачиваем видео напрямую в поток (без сохранения на диск для маленьких файлов)
+        logger.info(f"[worker] Начало потокового скачивания: url={url}, video_id={video_id}, quality={quality}, format_id={format_id}")
         
-        if not video_path:
+        # Используем новый метод потокового скачивания
+        stream_result = downloader.download_video_stream(url, format_id=format_id)
+        
+        if not stream_result:
             logger.error(f"[worker] Не удалось скачать видео: url={url}")
             return None
         
-        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        video_data, file_size, filename = stream_result
+        file_size_mb = file_size / (1024 * 1024)
         logger.info(f"[worker] Размер файла: {file_size_mb:.2f} MB")
         
         # Отправляем видео в канал
-        logger.info(f"[worker] Загрузка в канал: {video_path}")
-        message = await bot.send_video(
-            chat_id=CHANNEL_ID,
-            video=types.FSInputFile(video_path),
-            caption=f"Source: {url}"
-        )
-        message_id = message.message_id
+        # Для маленьких файлов (<50MB) - используем BufferedInputFile (из памяти)
+        # Для больших файлов - используем FSInputFile (временный файл)
+        try:
+            if isinstance(video_data, io.BytesIO):
+                # Маленький файл в памяти - используем BufferedInputFile
+                logger.info(f"[worker] Загрузка в канал из памяти: {file_size_mb:.2f} MB")
+                video_data.seek(0)  # Возвращаемся в начало потока
+                message = await bot.send_video(
+                    chat_id=CHANNEL_ID,
+                    video=types.BufferedInputFile(
+                        file=video_data.read(),
+                        filename=filename
+                    ),
+                    caption=f"Source: {url}"
+                )
+            else:
+                # Большой файл - используем FSInputFile (временный файл)
+                logger.info(f"[worker] Загрузка в канал из файла: {video_data} ({file_size_mb:.2f} MB)")
+                message = await bot.send_video(
+                    chat_id=CHANNEL_ID,
+                    video=types.FSInputFile(video_data),
+                    caption=f"Source: {url}"
+                )
+            
+            message_id = message.message_id
+        finally:
+            # Очищаем ресурсы
+            if isinstance(video_data, io.BytesIO):
+                video_data.close()
+            elif isinstance(video_data, str) and os.path.exists(video_data):
+                # Удаляем временный файл после отправки
+                try:
+                    os.remove(video_data)
+                    logger.info(f"[worker] Временный файл удален: {video_data}")
+                except Exception as e:
+                    logger.warning(f"[worker] Не удалось удалить временный файл {video_data}: {e}")
         
         # Получаем file_id из видео
         file_id = None
@@ -108,14 +147,28 @@ async def process_download_task(task: dict) -> Optional[int]:
         elif message.document:
             file_id = message.document.file_id
         
-        # Сохраняем в кэш
+        # Сохраняем в кэш с указанием качества (если указано)
         platform = platform or get_platform(url)
-        await db.save_to_cache(video_id, message_id, platform, file_id, original_url=url)
+        await db.save_to_cache(video_id, message_id, platform, file_id, original_url=url, quality=quality)
         
         logger.info(f"[worker] ✅ Видео успешно скачано и сохранено в кэш: video_id={video_id}, message_id={message_id}")
         
         # Публикуем событие о завершении скачивания (для wait_for_download)
         await db.publish_video_download_event(video_id, 'completed', message_id, file_id)
+        
+        # Публикуем событие DownloadCompletedEvent в очередь аналитики
+        # Примечание: в worker.py нет user_id, поэтому используем 0 (системный)
+        # Реальное событие с user_id будет опубликовано в bot.py после отправки видео пользователю
+        try:
+            event = DownloadCompletedEvent(
+                user_id=0,  # Системный user_id (worker не знает реального пользователя)
+                video_id=video_id,
+                platform=platform,
+                source='worker'  # Специальный источник для событий от worker
+            )
+            await db.add_analytics_event(event.to_json())
+        except Exception as e:
+            logger.error(f"[worker] Ошибка при публикации события DownloadCompletedEvent: {e}")
         
         return message_id
         
@@ -125,16 +178,8 @@ async def process_download_task(task: dict) -> Optional[int]:
         await db.publish_video_download_event(video_id, 'failed')
         return None
     finally:
-        # Удаляем временный файл
-        try:
-            if 'video_path' in locals() and video_path and os.path.exists(video_path):
-                os.remove(video_path)
-                logger.info(f"[worker] Временный файл удален: {video_path}")
-        except Exception as e:
-            logger.warning(f"[worker] Не удалось удалить файл {video_path}: {e}")
-        
-        # Освобождаем lock
-        await db.release_download_lock(video_id)
+        # Освобождаем lock (с учетом качества)
+        await db.release_download_lock(video_id, quality=quality)
 
 
 async def worker_loop():

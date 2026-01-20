@@ -3,3 +3,7 @@ python-dotenv
 yt-dlp
 pytest
 redis
+asyncpg
+psycopg2-binary
+fastapi
+uvicorn

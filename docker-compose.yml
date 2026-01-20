@@ -1,0 +1,190 @@
+services:
+  # Redis для кэширования и очередей
+  redis:
+    image: redis:7-alpine
+    container_name: downloader_bot_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL для аналитики
+  postgres:
+    image: postgres:15-alpine
+    container_name: downloader_bot_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Основной бот
+  bot:
+    build: .
+    container_name: downloader_bot
+    depends_on:
+      redis:
+        condition: service_healthy
+    # DNS: используем системные DNS хоста (работает с VPN) или Google DNS как fallback
+    dns:
+      - 127.0.0.11  # Docker's internal DNS (использует DNS хоста)
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    command: ["python", "main.py"]
+
+  # Worker для скачивания видео (1)
+  worker1:
+    build: .
+    container_name: downloader_bot_worker1
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # DNS: используем системные DNS хоста (работает с VPN) или Google DNS как fallback
+    dns:
+      - 127.0.0.11  # Docker's internal DNS (использует DNS хоста)
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+
+  # Worker для скачивания видео (2)
+  worker2:
+    build: .
+    container_name: downloader_bot_worker2
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # DNS: используем системные DNS хоста (работает с VPN) или Google DNS как fallback
+    dns:
+      - 127.0.0.11  # Docker's internal DNS (использует DNS хоста)
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+
+  # Миграции БД (запускается один раз при старте)
+  migrations:
+    build: .
+    container_name: downloader_bot_migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # DNS: используем системные DNS хоста (работает с VPN) или Google DNS как fallback
+    dns:
+      - 127.0.0.11  # Docker's internal DNS (использует DNS хоста)
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    restart: "no"
+    command: ["python", "migrations.py"]
+    profiles:
+      - init
+
+  # Analytics worker для обработки событий аналитики
+  analytics_worker:
+    build: .
+    container_name: downloader_bot_analytics_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    restart: unless-stopped
+    command: ["python", "analytics_worker.py"]
+
+  # Dashboard API
+  dashboard:
+    build: .
+    container_name: downloader_bot_dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    command: ["uvicorn", "dashboard:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  redis_data:
+  postgres_data:
+
+# Настройки сети по умолчанию (для доступа к интернету)
+networks:
+  default:
+    driver: bridge

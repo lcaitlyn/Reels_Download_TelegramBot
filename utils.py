@@ -77,6 +77,31 @@ def is_supported_url(url: str) -> bool:
     return any(platform in url_lower for platform in platforms)
 
 
+def is_youtube_video(url: str) -> bool:
+    """
+    Проверка, является ли URL YouTube видео (не Shorts)
+    
+    Args:
+        url: URL для проверки
+        
+    Returns:
+        True если это YouTube видео (не Shorts), False иначе
+    """
+    url_lower = url.lower()
+    if 'youtube.com' not in url_lower and 'youtu.be' not in url_lower:
+        return False
+    
+    # Shorts имеют /shorts/ в URL
+    if '/shorts/' in url_lower:
+        return False
+    
+    # Обычные видео имеют /watch?v= или youtu.be/
+    if '/watch?v=' in url_lower or 'youtu.be/' in url_lower:
+        return True
+    
+    return False
+
+
 def get_video_id_fast(url: str) -> tuple[Optional[str], str]:
     """
     Быстрое извлечение video_id из URL БЕЗ HTTP-запросов (парсинг URL)

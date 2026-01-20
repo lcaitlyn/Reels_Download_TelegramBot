@@ -20,10 +20,12 @@ from aiogram.types import (
     InlineKeyboardButton
 )
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 
 from database import Database
-from utils import normalize_url, get_platform, is_supported_url, get_video_id_fast
+from utils import normalize_url, get_platform, is_supported_url, get_video_id_fast, is_youtube_video
 from downloader import VideoDownloader
+from events import DownloadCompletedEvent, VideoViewClickedEvent
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -157,6 +159,44 @@ async def download_and_cache(url: str, user_id: int) -> Optional[int]:
         await db.release_download_lock(video_id)
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Команда /stats - показывает статистику пользователя"""
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    
+    try:
+        # Получаем статистику из Redis
+        downloads_total = await db.get_user_downloads_count(user_id)
+        downloads_today = await db.get_user_downloads_today(user_id)
+        downloads_month = await db.get_user_downloads_month(user_id)
+        
+        # Вычисляем оставшиеся бесплатные скачивания
+        free_limit = 10
+        remaining_free = max(0, free_limit - downloads_total)
+        
+        # Формируем сообщение
+        stats_text = (
+            f"📊 <b>Твоя статистика</b>\n\n"
+            f"📥 Всего скачано: <b>{downloads_total}</b>\n"
+            f"📅 Сегодня: <b>{downloads_today}</b>\n"
+            f"📆 Этот месяц: <b>{downloads_month}</b>\n\n"
+            #f"🆓 Бесплатных осталось: <b>{remaining_free}</b> из {free_limit}\n"
+        )
+        
+        '''
+        if downloads_total >= free_limit:
+            stats_text += "\n⚠️ Лимит бесплатных скачиваний достигнут"
+        else:
+            stats_text += f"\n✅ До лимита: <b>{free_limit - downloads_total}</b> скачиваний"
+        '''
+
+        await message.answer(stats_text, parse_mode="HTML")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении статистики для пользователя {user_id}: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении статистики. Попробуй позже.")
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Команда /start с поддержкой deep link"""
@@ -204,15 +244,47 @@ async def cmd_start(message: types.Message):
                     )
                     logger.info(f"✅ Видео отправлено из кэша через deep link (video_id): {video_id}")
                     return
+                except TelegramBadRequest as e:
+                    # Специфичная обработка: message not found
+                    error_message = str(e).lower()
+                    if "message not found" in error_message or "message to copy not found" in error_message:
+                        logger.warning(f"⚠️ Видео не найдено в канале (message_id={cached_message_id}), удаляю из кэша")
+                        # Удаляем невалидную запись из кэша
+                        try:
+                            await db.delete_from_cache(video_id=video_id, url=url)
+                        except Exception as del_err:
+                            logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                        # Продолжаем как будто видео нет в кэше
+                        cached_message_id = None
+                    else:
+                        raise
                 except Exception as e:
                     logger.error(f"❌ Ошибка при отправке из кэша: {e}")
             
             # Видео нет в кэше (еще не скачано или скачивается)
             if url:
+                # Публикуем событие VideoViewClickedEvent для deep link
+                try:
+                    event = VideoViewClickedEvent(
+                        user_id=message.from_user.id,
+                        video_id=video_id,
+                        event_type='deep_link'
+                    )
+                    await db.add_analytics_event(event.to_json())
+                except Exception as e:
+                    logger.error(f"Ошибка при публикации события VideoViewClickedEvent: {e}")
+                
+                # Обрабатываем referral код из параметра (если есть)
+                # Формат: platform_video_id или ref_REFERRAL_CODE
+                if param.startswith('ref_'):
+                    referral_code = param[4:]  # Убираем префикс "ref_"
+                    # TODO: Обработка referral кода (будет реализовано в этапе 6)
+                    logger.info(f"Обнаружен referral код: {referral_code} для пользователя {message.from_user.id}")
+                
                 # URL найден - видео скачивается, отправляем ⏳ и ждем
                 status_msg = await message.answer("⏳")
                 # Запускаем скачивание и ждем завершения
-                await download_and_send(url, message.chat.id, status_msg=status_msg)
+                await download_and_send(url, message.chat.id, status_msg=status_msg, user_id=message.from_user.id, source='deep_link')
                 return
             else:
                 # URL не найден - это ошибка, видео должно было быть сохранено при inline-запросе
@@ -251,12 +323,43 @@ async def cmd_start(message: types.Message):
                 )
                 logger.info(f"✅ Видео отправлено из кэша через deep link: {url}")
                 return
+            except TelegramBadRequest as e:
+                # Специфичная обработка: message not found
+                error_message = str(e).lower()
+                if "message not found" in error_message or "message to copy not found" in error_message:
+                    logger.warning(f"⚠️ Видео не найдено в канале (message_id={cached_message_id}), удаляю из кэша")
+                    # Удаляем невалидную запись из кэша
+                    try:
+                        await db.delete_from_cache(video_id=video_id, url=url)
+                    except Exception as del_err:
+                        logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                    # Продолжаем как будто видео нет в кэше
+                    cached_message_id = None
+                else:
+                    raise
             except Exception as e:
                 logger.error(f"❌ Ошибка при отправке из кэша: {e}")
         
+        # Публикуем событие VideoViewClickedEvent для deep link
+        try:
+            event = VideoViewClickedEvent(
+                user_id=message.from_user.id,
+                video_id=video_id,
+                event_type='deep_link'
+            )
+            await db.add_analytics_event(event.to_json())
+        except Exception as e:
+            logger.error(f"Ошибка при публикации события VideoViewClickedEvent: {e}")
+        
+        # Обрабатываем referral код из параметра (если есть)
+        if args_str and args_str.startswith('ref_'):
+            referral_code = args_str[4:]  # Убираем префикс "ref_"
+            # TODO: Обработка referral кода (будет реализовано в этапе 6)
+            logger.info(f"Обнаружен referral код: {referral_code} для пользователя {message.from_user.id}")
+        
         # Видео нет в кэше - скачиваем
         status_msg = await message.answer("⏳")
-        await download_and_send(url, message.chat.id, status_msg=status_msg)
+        await download_and_send(url, message.chat.id, status_msg=status_msg, user_id=message.from_user.id, source='deep_link')
     else:
         # Обычная команда /start без параметров
         await message.answer(
@@ -326,6 +429,77 @@ async def handle_message(message: types.Message):
         )
         return
     
+    # Проверяем, является ли это YouTube видео (не Shorts) - показываем выбор качества
+    if is_youtube_video(normalized_url):
+        # Получаем video_id
+        video_id, _ = get_video_id_fast(normalized_url)
+        if not video_id:
+            video_id = downloader.get_video_id(normalized_url)
+        if not video_id:
+            video_id = normalized_url  # Fallback
+        
+        # Получаем доступные форматы
+        formats = downloader.get_available_formats(normalized_url)
+        
+        if formats:
+            # Сохраняем URL в маппинг для получения в callback handler
+            await db.save_url_mapping(video_id, normalized_url, 'youtube')
+            
+            # Создаем кнопки с вариантами качества
+            keyboard_buttons = []
+            row = []
+            
+            for quality_label in ['480p', '720p', '1080p', 'audio']:
+                if quality_label in formats:
+                    # Проверяем, есть ли это качество в кэше
+                    cached = await db.check_quality_in_cache(video_id, quality_label)
+                    icon = "⚡️" if cached else "⏳"
+                    
+                    # Убираем URL из callback_data (ограничение Telegram: 64 байта)
+                    # Формат: quality:video_id:quality_label
+                    # video_id может быть длинным (например, "youtube:wWJ8lVLPaVY"), но это максимум ~30 байт
+                    # quality_label максимум 6 байт (например, "1080p")
+                    # Итого: "quality:" (8) + video_id (~30) + ":" (1) + quality_label (6) = ~45 байт < 64
+                    callback_data = f"quality:{video_id}:{quality_label}"
+                    
+                    row.append(
+                        InlineKeyboardButton(
+                            text=f"{icon} {quality_label}",
+                            callback_data=callback_data
+                        )
+                    )
+                    
+                    # По 2 кнопки в ряд
+                    if len(row) == 2:
+                        keyboard_buttons.append(row)
+                        row = []
+            
+            # Добавляем оставшиеся кнопки
+            if row:
+                keyboard_buttons.append(row)
+            
+            if keyboard_buttons:
+                # Удаляем сообщение со ссылкой (если это inline-результат)
+                if message.via_bot and message.via_bot.id == bot.id:
+                    try:
+                        await message.delete()
+                    except:
+                        pass
+                
+                # Отправляем сообщение с кнопками выбора качества
+                await message.answer(
+                    "📹 Выбери качество видео:",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+                )
+                return
+            else:
+                # Если форматы не найдены, продолжаем обычную обработку
+                logger.warning(f"Форматы не найдены для YouTube видео: {normalized_url}")
+        else:
+            # Если не удалось получить форматы, продолжаем обычную обработку
+            logger.warning(f"Не удалось получить форматы для YouTube видео: {normalized_url}")
+    
+    # Обычная обработка для не-YouTube видео или если выбор качества не сработал
     # Сначала проверяем кэш по URL напрямую (БЫСТРО, без yt-dlp extractor)
     cached_message_id = await db.get_cached_message_id(url=normalized_url)
     
@@ -361,11 +535,35 @@ async def handle_message(message: types.Message):
                 message_id=cached_message_id
             )
             logger.info(f"✅ Видео успешно скопировано из кэша в chat_id={message.chat.id}, result_message_id={result.message_id}: {normalized_url}")
+        except TelegramBadRequest as e:
+            # Специфичная обработка: message not found (канал удален, видео удалено)
+            error_message = str(e).lower()
+            if "message not found" in error_message or "message to copy not found" in error_message:
+                logger.warning(f"⚠️ Видео не найдено в канале (message_id={cached_message_id}), удаляю из кэша и перескачиваю")
+                # Удаляем невалидную запись из кэша
+                try:
+                    await db.delete_from_cache(video_id=video_id, url=normalized_url)
+                except Exception as del_err:
+                    logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                # Перескачиваем видео
+                status_msg = await message.answer("⏳ Видео не найдено в кэше, скачиваю заново...")
+                user_id = message.from_user.id if message.from_user else message.chat.id
+                source = 'inline' if (message.via_bot and message.via_bot.id == bot.id) else 'message'
+                await download_and_send(normalized_url, message.chat.id, status_msg=status_msg, user_id=user_id, source=source)
+            else:
+                # Другая ошибка BadRequest - логируем и перескачиваем
+                logger.error(f"❌ TelegramBadRequest при пересылке из кэша: {e}", exc_info=True)
+                status_msg = await message.answer("⏳")
+                user_id = message.from_user.id if message.from_user else message.chat.id
+                source = 'inline' if (message.via_bot and message.via_bot.id == bot.id) else 'message'
+                await download_and_send(normalized_url, message.chat.id, status_msg=status_msg, user_id=user_id, source=source)
         except Exception as e:
             logger.error(f"❌ Ошибка при пересылке из кэша: {e}", exc_info=True)
             # Если пересылка не удалась, скачиваем заново
             status_msg = await message.answer("⏳")
-            await download_and_send(normalized_url, message.chat.id, status_msg=status_msg)
+            user_id = message.from_user.id if message.from_user else message.chat.id
+            source = 'inline' if (message.via_bot and message.via_bot.id == bot.id) else 'message'
+            await download_and_send(normalized_url, message.chat.id, status_msg=status_msg, user_id=user_id, source=source)
     else:
         # Скачиваем новое видео - сначала удаляем сообщение со ссылкой
         if message.via_bot and message.via_bot.id == bot.id:
@@ -375,7 +573,9 @@ async def handle_message(message: types.Message):
                 pass
         
         status_msg = await message.answer("⏳")
-        await download_and_send(normalized_url, message.chat.id, status_msg=status_msg)
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        source = 'inline' if (message.via_bot and message.via_bot.id == bot.id) else 'message'
+        await download_and_send(normalized_url, message.chat.id, status_msg=status_msg, user_id=user_id, source=source)
 
 
 async def background_download(url: str, video_id: str):
@@ -391,7 +591,35 @@ async def background_download(url: str, video_id: str):
         logger.error(f"[background_download] ❌ Ошибка при фоновом скачивании: {url} (video_id: {video_id}): {e}", exc_info=True)
 
 
-async def download_and_send(url: str, chat_id: int, status_msg: types.Message = None):
+async def background_download_with_quality(url: str, video_id: str, quality: str, format_id: str):
+    """Фоновое скачивание YouTube видео с указанным качеством"""
+    try:
+        logger.info(f"[background_download_with_quality] Начало фонового скачивания: {url} (video_id: {video_id}, quality: {quality})")
+        
+        # Проверяем кэш для этого качества
+        cached_message_id = await db.get_cached_message_id(video_id=video_id, quality=quality)
+        if cached_message_id and cached_message_id != 0:
+            logger.info(f"[background_download_with_quality] Видео уже в кэше: {url} (video_id: {video_id}, quality: {quality})")
+            return
+        
+        # Добавляем задачу в очередь с указанием качества
+        task_added = await db.add_download_task(
+            url=url,
+            video_id=video_id,
+            platform='youtube',
+            quality=quality,
+            format_id=format_id
+        )
+        
+        if task_added:
+            logger.info(f"[background_download_with_quality] Задача добавлена в очередь: {url} (video_id: {video_id}, quality: {quality})")
+        else:
+            logger.info(f"[background_download_with_quality] Задача уже обрабатывается: {url} (video_id: {video_id}, quality: {quality})")
+    except Exception as e:
+        logger.error(f"[background_download_with_quality] ❌ Ошибка при фоновом скачивании: {url} (video_id: {video_id}, quality: {quality}): {e}", exc_info=True)
+
+
+async def download_and_send(url: str, chat_id: int, status_msg: types.Message = None, user_id: int = None, source: str = 'message', quality: str = None, format_id: str = None):
     """
     Добавить задачу на скачивание в очередь для background worker
     Ожидает завершения скачивания и отправляет видео пользователю
@@ -400,8 +628,25 @@ async def download_and_send(url: str, chat_id: int, status_msg: types.Message = 
         url: URL видео для скачивания
         chat_id: ID чата для отправки видео
         status_msg: Сообщение со статусом "⏳" для удаления после скачивания
+        user_id: ID пользователя (для аналитики и проверки лимитов)
+        source: Источник запроса ('message', 'inline', 'deep_link')
     """
     try:
+        # Получаем user_id из chat_id, если не передан
+        if user_id is None:
+            user_id = chat_id
+        
+        # Проверяем лимит пользователя перед скачиванием (Redis get)
+        try:
+            downloads_count = await db.get_user_downloads_count(user_id)
+            if downloads_count >= 10:
+                # Лимит превышен - пока пропускаем показ рекламы (заготовка на будущее)
+                logger.info(f"Лимит пользователя {user_id} превышен: {downloads_count} скачиваний (пропускаем показ рекламы)")
+                # TODO: В будущем здесь будет показ рекламы/ограничения
+        except Exception as redis_err:
+            # Redis недоступен - пропускаем проверку лимита
+            logger.warning(f"⚠️ Redis недоступен при проверке лимита: {redis_err}, пропускаю проверку")
+        
         # Получаем video_id для проверки кэша и добавления задачи
         video_id, normalized_url = get_video_id_fast(url)
         if not video_id:
@@ -414,7 +659,13 @@ async def download_and_send(url: str, chat_id: int, status_msg: types.Message = 
         platform = get_platform(url)
         
         # Проверяем кэш - если видео уже скачано, отправляем сразу
-        cached_message_id = await db.get_cached_message_id(video_id=video_id, url=normalized_url)
+        # Если указано качество, проверяем кэш для этого качества
+        try:
+            cached_message_id = await db.get_cached_message_id(video_id=video_id, url=normalized_url, quality=quality)
+        except Exception as redis_err:
+            # Redis недоступен - работаем без кэша
+            logger.error(f"⚠️ Redis недоступен: {redis_err}, работаю без кэша")
+            cached_message_id = None
         
         if cached_message_id and cached_message_id != 0:
             # Видео уже в кэше - отправляем сразу
@@ -425,16 +676,59 @@ async def download_and_send(url: str, chat_id: int, status_msg: types.Message = 
                 except:
                     pass
             
-            await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=CHANNEL_ID,
-                message_id=cached_message_id
-            )
-            logger.info("Видео скопировано из кэша")
-            return
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=CHANNEL_ID,
+                    message_id=cached_message_id
+                )
+                logger.info("Видео скопировано из кэша")
+                
+                # Публикуем событие DownloadCompletedEvent (не блокируя ответ)
+                try:
+                    event = DownloadCompletedEvent(
+                        user_id=user_id,
+                        video_id=video_id,
+                        platform=platform,
+                        source=source
+                    )
+                    await db.add_analytics_event(event.to_json())
+                except Exception as e:
+                    logger.error(f"Ошибка при публикации события DownloadCompletedEvent: {e}")
+                
+                return
+            except TelegramBadRequest as e:
+                # Специфичная обработка: message not found
+                error_message = str(e).lower()
+                if "message not found" in error_message or "message to copy not found" in error_message:
+                    logger.warning(f"⚠️ Видео не найдено в канале (message_id={cached_message_id}), удаляю из кэша и перескачиваю")
+                    # Удаляем невалидную запись из кэша
+                    try:
+                        await db.delete_from_cache(video_id=video_id, url=normalized_url)
+                    except Exception as del_err:
+                        logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                    # Продолжаем как будто видео нет в кэше (перескачиваем)
+                    # Не возвращаемся, продолжаем выполнение ниже
+                else:
+                    # Другая ошибка BadRequest - пробрасываем
+                    raise
+            except Exception as e:
+                logger.error(f"❌ Ошибка при копировании из кэша: {e}", exc_info=True)
+                # Продолжаем как будто видео нет в кэше
         
         # Видео нет в кэше - добавляем задачу в очередь для background worker
-        task_added = await db.add_download_task(url, video_id, platform)
+        try:
+            task_added = await db.add_download_task(url, video_id, platform, quality=quality, format_id=format_id)
+        except Exception as redis_err:
+            # Redis недоступен - не можем добавить задачу в очередь
+            logger.error(f"⚠️ Redis недоступен при добавлении задачи: {redis_err}")
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
+            await bot.send_message(chat_id, "❌ Сервис временно недоступен. Попробуй позже.")
+            return
         
         if task_added:
             # Задача добавлена в очередь - ждем завершения скачивания
@@ -449,12 +743,39 @@ async def download_and_send(url: str, chat_id: int, status_msg: types.Message = 
                     except:
                         pass
                 
-                await bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=CHANNEL_ID,
-                    message_id=message_id
-                )
-                logger.info("Видео скопировано из кэша после обработки worker'ом")
+                try:
+                    await bot.copy_message(
+                        chat_id=chat_id,
+                        from_chat_id=CHANNEL_ID,
+                        message_id=message_id
+                    )
+                    logger.info("Видео скопировано из кэша после обработки worker'ом")
+                except TelegramBadRequest as e:
+                    # Специфичная обработка: message not found (редкий случай, но возможен)
+                    error_message = str(e).lower()
+                    if "message not found" in error_message or "message to copy not found" in error_message:
+                        logger.warning(f"⚠️ Видео не найдено в канале сразу после скачивания (message_id={message_id})")
+                        # Удаляем невалидную запись и сообщаем пользователю
+                        try:
+                            await db.delete_from_cache(video_id=video_id, url=normalized_url)
+                        except Exception as del_err:
+                            logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                        await bot.send_message(chat_id, "❌ Произошла ошибка при отправке видео. Попробуй еще раз.")
+                        return
+                    else:
+                        raise
+                
+                # Публикуем событие DownloadCompletedEvent (не блокируя ответ)
+                try:
+                    event = DownloadCompletedEvent(
+                        user_id=user_id,
+                        video_id=video_id,
+                        platform=platform,
+                        source=source
+                    )
+                    await db.add_analytics_event(event.to_json())
+                except Exception as e:
+                    logger.error(f"Ошибка при публикации события DownloadCompletedEvent: {e}")
             else:
                 # Timeout - видео не скачалось
                 if status_msg:
@@ -476,12 +797,39 @@ async def download_and_send(url: str, chat_id: int, status_msg: types.Message = 
                     except:
                         pass
                 
-                await bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=CHANNEL_ID,
-                    message_id=message_id
-                )
-                logger.info("Видео скопировано из кэша после ожидания")
+                try:
+                    await bot.copy_message(
+                        chat_id=chat_id,
+                        from_chat_id=CHANNEL_ID,
+                        message_id=message_id
+                    )
+                    logger.info("Видео скопировано из кэша после ожидания")
+                except TelegramBadRequest as e:
+                    # Специфичная обработка: message not found
+                    error_message = str(e).lower()
+                    if "message not found" in error_message or "message to copy not found" in error_message:
+                        logger.warning(f"⚠️ Видео не найдено в канале после ожидания (message_id={message_id})")
+                        # Удаляем невалидную запись и сообщаем пользователю
+                        try:
+                            await db.delete_from_cache(video_id=video_id, url=normalized_url)
+                        except Exception as del_err:
+                            logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                        await bot.send_message(chat_id, "❌ Произошла ошибка при отправке видео. Попробуй еще раз.")
+                        return
+                    else:
+                        raise
+                
+                # Публикуем событие DownloadCompletedEvent (не блокируя ответ)
+                try:
+                    event = DownloadCompletedEvent(
+                        user_id=user_id,
+                        video_id=video_id,
+                        platform=platform,
+                        source=source
+                    )
+                    await db.add_analytics_event(event.to_json())
+                except Exception as e:
+                    logger.error(f"Ошибка при публикации события DownloadCompletedEvent: {e}")
             else:
                 # Timeout - видео не скачалось
                 if status_msg:
@@ -537,79 +885,229 @@ async def inline_handler(inline_query: InlineQuery):
             platform = get_platform(normalized_url)
             # Сначала пытаемся получить video_id быстрым способом (без HTTP-запросов)
             video_id, normalized_url = get_video_id_fast(query)
-            cached_file_id = await db.get_cached_file_id(video_id=video_id, url=normalized_url)
             
-            if cached_file_id:
-                # Видео найдено в кэше - используем InlineQueryResultCachedVideo
-                results.append(
-                    InlineQueryResultCachedVideo(
-                        id=f"cached_{abs(hash(normalized_url))}",
-                        video_file_id=cached_file_id,
-                        title=f"✅ Видео из кэша ({platform})",
-                        description=normalized_url
-                    )
-                )
-            else:
-                # Видео нет в кэше - отправляем ссылку на видео + кнопку с deep link
-                # Получаем username бота для deep link (кэшируем для скорости)
-                if not hasattr(bot, '_cached_username'):
-                    bot_info = await bot.get_me()
-                    bot._cached_username = bot_info.username
-                bot_username = bot._cached_username
+            # Для YouTube видео (не Shorts) - особая логика
+            if is_youtube_video(normalized_url) and video_id:
+                # Проверяем кэш на наличие лучшего качества
+                best_quality_result = await db.get_best_cached_quality(video_id)
                 
-                # Используем video_id в deep link (короткий формат с _, работает в Telegram)
-                # Если video_id не получен быстрым способом (например, TikTok) - используем yt-dlp (МЕДЛЕННО)
-                # Но только если видео не в кэше (иначе не нужно)
-                if not video_id:
-                    # Для TikTok может потребоваться yt-dlp, но это медленно - делаем только если критично
-                    # Можно отложить до момента, когда пользователь нажмет кнопку
-                    video_id = None  # Не получаем через yt-dlp здесь для скорости
-                
-                if video_id:
-                    # video_id в БД хранится в формате "platform:video_id" (с :)
-                    # Для deep link заменяем : на _ (Telegram не поддерживает : в параметрах)
-                    video_id_for_deeplink = video_id.replace(':', '_')
-                    
-                    # Сохраняем URL в кэш для маппинга video_id -> url (до скачивания)
-                    # Это позволит найти URL в /start по video_id
-                    # В БД храним в формате platform:video_id
-                    await db.save_url_mapping(video_id, normalized_url, platform)
-                    logger.info(f"[inline_handler] Сохранен маппинг video_id -> URL: {video_id} -> {normalized_url}")
-                    
-                    # Запускаем фоновое скачивание видео
-                    asyncio.create_task(background_download(normalized_url, video_id))
-                    logger.info(f"[inline_handler] Запущено фоновое скачивание видео: {normalized_url}")
-                    
-                    # Используем короткий video_id в deep link (формат platform_video_id с _ для Telegram)
-                    deep_link = f"https://t.me/{bot_username}?start={video_id_for_deeplink}"
-                    logger.info(f"[inline_handler] Deep link с video_id (deep link): {video_id_for_deeplink}, БД: {video_id}")
-                else:
-                    # Fallback: используем URL (может не работать из-за лимита длины)
-                    encoded_url = quote(normalized_url, safe='')
-                    deep_link = f"https://t.me/{bot_username}?start={encoded_url}"
-                    logger.warning(f"[inline_handler] Используется fallback с URL в deep link (video_id не получен)")
-                
-                result_id = f"link_{abs(hash(normalized_url))}"
-                results.append(
-                    InlineQueryResultArticle(
-                        id=result_id,
-                        title=f"🔗 Ссылка на видео ({platform})",
-                        description="Нажмите кнопку чтобы скачать видео",
-                        input_message_content=InputTextMessageContent(
-                            message_text=normalized_url
-                        ),
-                        reply_markup=InlineKeyboardMarkup(
-                            inline_keyboard=[
-                                [
-                                    InlineKeyboardButton(
-                                        text="👀 Посмотреть видео",
-                                        url=deep_link
-                                    )
-                                ]
-                            ]
+                if best_quality_result:
+                    # Видео есть в кэше - отправляем лучшее качество
+                    quality_label, cached_file_id = best_quality_result
+                    results.append(
+                        InlineQueryResultCachedVideo(
+                            id=f"cached_{abs(hash(normalized_url))}_{quality_label}",
+                            video_file_id=cached_file_id,
+                            title=f"✅ Видео из кэша ({platform}, {quality_label})",
+                            description=normalized_url
                         )
                     )
-                )
+                else:
+                    # Видео нет в кэше - получаем форматы и выбираем качество ближайшее к 480p
+                    formats = downloader.get_available_formats(normalized_url)
+                    if formats:
+                        default_quality = await db.get_default_quality_for_download(formats)
+                        if default_quality:
+                            quality_label, format_id = default_quality
+                            
+                            # Получаем username бота для deep link
+                            if not hasattr(bot, '_cached_username'):
+                                bot_info = await bot.get_me()
+                                bot._cached_username = bot_info.username
+                            bot_username = bot._cached_username
+                            
+                            # Сохраняем URL в кэш для маппинга
+                            await db.save_url_mapping(video_id, normalized_url, platform)
+                            
+                            # Запускаем фоновое скачивание с качеством по умолчанию (480p или ближайшим)
+                            asyncio.create_task(background_download_with_quality(normalized_url, video_id, quality_label, format_id))
+                            logger.info(f"[inline_handler] Запущено фоновое скачивание YouTube видео с качеством {quality_label}: {normalized_url}")
+                            
+                            # Создаем deep link
+                            video_id_for_deeplink = video_id.replace(':', '_')
+                            deep_link = f"https://t.me/{bot_username}?start={video_id_for_deeplink}"
+                            
+                            results.append(
+                                InlineQueryResultArticle(
+                                    id=f"link_{abs(hash(normalized_url))}",
+                                    title=f"🔗 YouTube видео ({platform})",
+                                    description=f"Скачать {quality_label} (ближайшее к 480p)",
+                                    input_message_content=InputTextMessageContent(
+                                        message_text=normalized_url
+                                    ),
+                                    reply_markup=InlineKeyboardMarkup(
+                                        inline_keyboard=[
+                                            [
+                                                InlineKeyboardButton(
+                                                    text="👀 Посмотреть видео",
+                                                    url=deep_link
+                                                )
+                                            ]
+                                        ]
+                                    )
+                                )
+                            )
+                        else:
+                            # Не удалось определить качество - fallback на обычную логику
+                            cached_file_id = await db.get_cached_file_id(video_id=video_id, url=normalized_url)
+                            if cached_file_id:
+                                results.append(
+                                    InlineQueryResultCachedVideo(
+                                        id=f"cached_{abs(hash(normalized_url))}",
+                                        video_file_id=cached_file_id,
+                                        title=f"✅ Видео из кэша ({platform})",
+                                        description=normalized_url
+                                    )
+                                )
+                            else:
+                                # Fallback - показываем обычную ссылку
+                                if not hasattr(bot, '_cached_username'):
+                                    bot_info = await bot.get_me()
+                                    bot._cached_username = bot_info.username
+                                bot_username = bot._cached_username
+                                video_id_for_deeplink = video_id.replace(':', '_')
+                                deep_link = f"https://t.me/{bot_username}?start={video_id_for_deeplink}"
+                                
+                                await db.save_url_mapping(video_id, normalized_url, platform)
+                                
+                                results.append(
+                                    InlineQueryResultArticle(
+                                        id=f"link_{abs(hash(normalized_url))}",
+                                        title=f"🔗 Ссылка на видео ({platform})",
+                                        description="Нажмите кнопку чтобы скачать видео",
+                                        input_message_content=InputTextMessageContent(
+                                            message_text=normalized_url
+                                        ),
+                                        reply_markup=InlineKeyboardMarkup(
+                                            inline_keyboard=[
+                                                [
+                                                    InlineKeyboardButton(
+                                                        text="👀 Посмотреть видео",
+                                                        url=deep_link
+                                                    )
+                                                ]
+                                            ]
+                                        )
+                                    )
+                                )
+                    else:
+                        # Не удалось получить форматы - fallback
+                        cached_file_id = await db.get_cached_file_id(video_id=video_id, url=normalized_url)
+                        if cached_file_id:
+                            results.append(
+                                InlineQueryResultCachedVideo(
+                                    id=f"cached_{abs(hash(normalized_url))}",
+                                    video_file_id=cached_file_id,
+                                    title=f"✅ Видео из кэша ({platform})",
+                                    description=normalized_url
+                                )
+                            )
+                        else:
+                            # Fallback - показываем обычную ссылку
+                            if not hasattr(bot, '_cached_username'):
+                                bot_info = await bot.get_me()
+                                bot._cached_username = bot_info.username
+                            bot_username = bot._cached_username
+                            video_id_for_deeplink = video_id.replace(':', '_')
+                            deep_link = f"https://t.me/{bot_username}?start={video_id_for_deeplink}"
+                            
+                            await db.save_url_mapping(video_id, normalized_url, platform)
+                            
+                            results.append(
+                                InlineQueryResultArticle(
+                                    id=f"link_{abs(hash(normalized_url))}",
+                                    title=f"🔗 Ссылка на видео ({platform})",
+                                    description="Нажмите кнопку чтобы скачать видео",
+                                    input_message_content=InputTextMessageContent(
+                                        message_text=normalized_url
+                                    ),
+                                    reply_markup=InlineKeyboardMarkup(
+                                        inline_keyboard=[
+                                            [
+                                                InlineKeyboardButton(
+                                                    text="👀 Посмотреть видео",
+                                                    url=deep_link
+                                                )
+                                            ]
+                                        ]
+                                    )
+                                )
+                            )
+            else:
+                # Для TikTok, Instagram, Shorts - обычная логика (сразу отправляем если в кэше)
+                cached_file_id = await db.get_cached_file_id(video_id=video_id, url=normalized_url)
+                
+                if cached_file_id:
+                    # Видео найдено в кэше - используем InlineQueryResultCachedVideo
+                    results.append(
+                        InlineQueryResultCachedVideo(
+                            id=f"cached_{abs(hash(normalized_url))}",
+                            video_file_id=cached_file_id,
+                            title=f"✅ Видео из кэша ({platform})",
+                            description=normalized_url
+                        )
+                    )
+                else:
+                    # Видео нет в кэше - отправляем ссылку на видео + кнопку с deep link
+                    # Получаем username бота для deep link (кэшируем для скорости)
+                    if not hasattr(bot, '_cached_username'):
+                        bot_info = await bot.get_me()
+                        bot._cached_username = bot_info.username
+                    bot_username = bot._cached_username
+                    
+                    # Используем video_id в deep link (короткий формат с _, работает в Telegram)
+                    # Если video_id не получен быстрым способом (например, TikTok) - используем yt-dlp (МЕДЛЕННО)
+                    # Но только если видео не в кэше (иначе не нужно)
+                    if not video_id:
+                        # Для TikTok может потребоваться yt-dlp, но это медленно - делаем только если критично
+                        # Можно отложить до момента, когда пользователь нажмет кнопку
+                        video_id = None  # Не получаем через yt-dlp здесь для скорости
+                    
+                    if video_id:
+                        # video_id в БД хранится в формате "platform:video_id" (с :)
+                        # Для deep link заменяем : на _ (Telegram не поддерживает : в параметрах)
+                        video_id_for_deeplink = video_id.replace(':', '_')
+                        
+                        # Сохраняем URL в кэш для маппинга video_id -> url (до скачивания)
+                        # Это позволит найти URL в /start по video_id
+                        # В БД храним в формате platform:video_id
+                        await db.save_url_mapping(video_id, normalized_url, platform)
+                        logger.info(f"[inline_handler] Сохранен маппинг video_id -> URL: {video_id} -> {normalized_url}")
+                        
+                        # Запускаем фоновое скачивание видео
+                        asyncio.create_task(background_download(normalized_url, video_id))
+                        logger.info(f"[inline_handler] Запущено фоновое скачивание видео: {normalized_url}")
+                        
+                        # Используем короткий video_id в deep link (формат platform_video_id с _ для Telegram)
+                        deep_link = f"https://t.me/{bot_username}?start={video_id_for_deeplink}"
+                        logger.info(f"[inline_handler] Deep link с video_id (deep link): {video_id_for_deeplink}, БД: {video_id}")
+                    else:
+                        # Fallback: используем URL (может не работать из-за лимита длины)
+                        encoded_url = quote(normalized_url, safe='')
+                        deep_link = f"https://t.me/{bot_username}?start={encoded_url}"
+                        logger.warning(f"[inline_handler] Используется fallback с URL в deep link (video_id не получен)")
+                    
+                    result_id = f"link_{abs(hash(normalized_url))}"
+                    results.append(
+                        InlineQueryResultArticle(
+                            id=result_id,
+                            title=f"🔗 Ссылка на видео ({platform})",
+                            description="Нажмите кнопку чтобы скачать видео",
+                            input_message_content=InputTextMessageContent(
+                                message_text=normalized_url
+                            ),
+                            reply_markup=InlineKeyboardMarkup(
+                                inline_keyboard=[
+                                    [
+                                        InlineKeyboardButton(
+                                            text="👀 Посмотреть видео",
+                                            url=deep_link
+                                        )
+                                    ]
+                                ]
+                            )
+                        )
+                    )
     else:
         # Если запрос не URL - показываем кнопку для отправки текста
         # При нажатии будет отправлено текстовое сообщение, которое обработает handle_message
@@ -693,6 +1191,173 @@ async def callback_download_handler(callback: CallbackQuery):
             await bot.send_message(chat_id, "❌ Произошла ошибка при скачивании видео. Попробуй позже.")
 
 
+@dp.callback_query(F.data.startswith("quality:"))
+async def callback_quality_handler(callback: CallbackQuery):
+    """Обработка выбора качества для YouTube видео"""
+    logger.info(f"[callback_quality_handler] Вызван: callback_data={callback.data}")
+    
+    # Формат: quality:video_id:quality_label
+    # video_id может содержать двоеточие (например, "youtube:wWJ8lVLPaVY")
+    # Поэтому нужно правильно разбить строку
+    if not callback.data.startswith("quality:"):
+        await callback.answer("❌ Ошибка в данных")
+        return
+    
+    # Убираем префикс "quality:"
+    data_without_prefix = callback.data[8:]  # len("quality:") = 8
+    
+    # Находим последнее двоеточие (разделитель между video_id и quality_label)
+    last_colon_index = data_without_prefix.rfind(":")
+    if last_colon_index == -1:
+        await callback.answer("❌ Ошибка в данных")
+        return
+    
+    # Разбиваем на video_id и quality_label
+    video_id = data_without_prefix[:last_colon_index]
+    quality_label = data_without_prefix[last_colon_index + 1:]
+    
+    logger.info(f"[callback_quality_handler] video_id={video_id}, quality_label={quality_label}")
+    
+    # Получаем URL из маппинга в базе данных
+    normalized_url = await db.get_original_url_by_video_id(video_id)
+    logger.info(f"[callback_quality_handler] URL из маппинга: {normalized_url}")
+    
+    if not normalized_url:
+        # Если URL не найден в маппинге, пытаемся восстановить из video_id
+        # Для YouTube: video_id имеет формат "youtube:VIDEO_ID"
+        if video_id.startswith("youtube:"):
+            video_id_only = video_id.split(":", 1)[1]
+            normalized_url = f"https://www.youtube.com/watch?v={video_id_only}"
+            logger.info(f"[callback_quality_handler] URL восстановлен из video_id: {normalized_url}")
+            # Сохраняем восстановленный URL в маппинг для будущих запросов
+            await db.save_url_mapping(video_id, normalized_url, 'youtube')
+        else:
+            logger.error(f"[callback_quality_handler] URL не найден для video_id={video_id}")
+            await callback.answer("❌ URL не найден. Попробуй отправить ссылку заново.")
+            return
+    
+    # Отвечаем на callback
+    await callback.answer(f"⏳ Скачиваю {quality_label}...")
+    
+    # Получаем информацию о формате
+    formats = downloader.get_available_formats(normalized_url)
+    if not formats or quality_label not in formats:
+        await callback.message.edit_text("❌ Выбранное качество недоступно")
+        return
+    
+    format_info = formats[quality_label]
+    format_id = format_info['format_id']
+    
+    # Проверяем кэш для этого качества
+    cached_message_id = await db.get_cached_message_id(video_id=video_id, quality=quality_label)
+    
+    if cached_message_id and cached_message_id != 0:
+        # Видео уже в кэше - отправляем сразу
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        
+        try:
+            await bot.copy_message(
+                chat_id=callback.message.chat.id,
+                from_chat_id=CHANNEL_ID,
+                message_id=cached_message_id
+            )
+            logger.info(f"✅ Видео {quality_label} отправлено из кэша")
+            
+            # Публикуем событие DownloadCompletedEvent
+            try:
+                event = DownloadCompletedEvent(
+                    user_id=callback.from_user.id,
+                    video_id=video_id,
+                    platform='youtube',
+                    source='message'
+                )
+                await db.add_analytics_event(event.to_json())
+            except Exception as e:
+                logger.error(f"Ошибка при публикации события DownloadCompletedEvent: {e}")
+        except TelegramBadRequest as e:
+            error_message = str(e).lower()
+            if "message not found" in error_message or "message to copy not found" in error_message:
+                logger.warning(f"⚠️ Видео не найдено в канале, удаляю из кэша и перескачиваю")
+                await db.delete_from_cache(video_id=video_id, quality=quality_label)
+                # Продолжаем скачивание ниже
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отправке из кэша: {e}", exc_info=True)
+            # Продолжаем скачивание ниже
+    
+    # Видео нет в кэше - скачиваем
+    if not cached_message_id or cached_message_id == 0:
+        status_msg = await callback.message.edit_text(f"⏳ Скачиваю {quality_label}...")
+        
+        # Добавляем задачу в очередь с указанием качества
+        task_added = await db.add_download_task(
+            url=normalized_url,
+            video_id=video_id,
+            platform='youtube',
+            quality=quality_label,
+            format_id=format_id
+        )
+        
+        if task_added:
+            # Ждем завершения скачивания с учетом качества
+            cached_message_id = await db.wait_for_download(video_id, timeout=1800.0, quality=quality_label)
+            
+            if cached_message_id:
+                try:
+                    if status_msg:
+                        await status_msg.delete()
+                except:
+                    pass
+                
+                try:
+                    await bot.copy_message(
+                        chat_id=callback.message.chat.id,
+                        from_chat_id=CHANNEL_ID,
+                        message_id=cached_message_id
+                    )
+                    logger.info(f"✅ Видео {quality_label} отправлено после скачивания")
+                    
+                    # Публикуем событие DownloadCompletedEvent
+                    try:
+                        event = DownloadCompletedEvent(
+                            user_id=callback.from_user.id,
+                            video_id=video_id,
+                            platform='youtube',
+                            source='message'
+                        )
+                        await db.add_analytics_event(event.to_json())
+                    except Exception as e:
+                        logger.error(f"Ошибка при публикации события DownloadCompletedEvent: {e}")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при отправке видео: {e}", exc_info=True)
+                    await bot.send_message(callback.message.chat.id, "❌ Произошла ошибка при отправке видео")
+            else:
+                if status_msg:
+                    try:
+                        await status_msg.delete()
+                    except:
+                        pass
+                await bot.send_message(callback.message.chat.id, "❌ Не удалось скачать видео за отведенное время")
+        else:
+            # Задача уже обрабатывается - ждем с учетом качества
+            cached_message_id = await db.wait_for_download(video_id, timeout=1800.0, quality=quality_label)
+            if cached_message_id:
+                try:
+                    if status_msg:
+                        await status_msg.delete()
+                except:
+                    pass
+                await bot.copy_message(
+                    chat_id=callback.message.chat.id,
+                    from_chat_id=CHANNEL_ID,
+                    message_id=cached_message_id
+                )
+
+
 @dp.callback_query(F.data.startswith("resend:"))
 async def callback_resend_handler(callback: CallbackQuery):
     """Обработка нажатия кнопки 'Отправить еще раз'"""
@@ -729,14 +1394,31 @@ async def callback_resend_handler(callback: CallbackQuery):
             return
         
         # Отправляем видео из кэша (новое сообщение)
-        await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=CHANNEL_ID,
-            message_id=cached_message_id
-        )
-        
-        logger.info(f"✅ Видео успешно отправлено еще раз в chat_id={chat_id}: {normalized_url}")
-        
+        try:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=CHANNEL_ID,
+                message_id=cached_message_id
+            )
+            logger.info(f"✅ Видео успешно отправлено еще раз в chat_id={chat_id}: {normalized_url}")
+        except TelegramBadRequest as e:
+            # Специфичная обработка: message not found
+            error_message = str(e).lower()
+            if "message not found" in error_message or "message to copy not found" in error_message:
+                logger.warning(f"⚠️ Видео не найдено в канале (message_id={cached_message_id}), удаляю из кэша")
+                # Удаляем невалидную запись из кэша
+                try:
+                    video_id, _ = get_video_id_fast(normalized_url)
+                    if not video_id:
+                        video_id = downloader.get_video_id(normalized_url)
+                    if not video_id:
+                        video_id = normalized_url
+                    await db.delete_from_cache(video_id=video_id, url=normalized_url)
+                except Exception as del_err:
+                    logger.error(f"Ошибка при удалении из кэша: {del_err}")
+                await bot.send_message(chat_id, "❌ Видео не найдено в кэше. Попробуй отправить ссылку заново.")
+            else:
+                raise
     except Exception as e:
         logger.error(f"❌ Ошибка при отправке видео из кэша: {e}", exc_info=True)
         await bot.send_message(chat_id, "❌ Произошла ошибка при отправке видео. Попробуй позже.")
@@ -744,8 +1426,30 @@ async def callback_resend_handler(callback: CallbackQuery):
 
 @dp.chosen_inline_result()
 async def chosen_inline_handler(chosen: types.ChosenInlineResult):
-    """Обработка выбора inline-результата (для логирования)"""
+    """Обработка выбора inline-результата (для логирования и аналитики)"""
     logger.info(f"[chosen_inline_result] Выбран результат: result_id={chosen.result_id}, query={chosen.query}, user={chosen.from_user.id}")
+    
+    # Публикуем событие VideoViewClickedEvent при клике на кнопку в inline query
+    try:
+        query = chosen.query.strip() if chosen.query else ""
+        video_id = None
+        
+        # Пытаемся получить video_id из query (если это URL)
+        if query.startswith(('http://', 'https://')):
+            normalized_url = normalize_url(query)
+            video_id, _ = get_video_id_fast(normalized_url)
+            if not video_id:
+                # Не используем yt-dlp здесь для скорости, video_id может быть None
+                pass
+        
+        event = VideoViewClickedEvent(
+            user_id=chosen.from_user.id,
+            video_id=video_id,
+            event_type='button_click'
+        )
+        await db.add_analytics_event(event.to_json())
+    except Exception as e:
+        logger.error(f"Ошибка при публикации события VideoViewClickedEvent: {e}")
 
 
 async def run_bot():
