@@ -1,6 +1,6 @@
 """
 Background Worker для обработки задач на скачивание видео из очереди Redis
-Работает как отдельный процесс, слушает очередь задач и скачивает видео
+Тупой исполнитель - исполняет DownloadPlan через YtDlpService
 """
 import os
 import io
@@ -15,6 +15,9 @@ from src.database.redis_db import Database
 from src.downloader.downloader import VideoDownloader
 from src.utils.utils import get_platform
 from src.events.events import DownloadCompletedEvent
+from src.services.service_factory import ServiceFactory
+from src.services.link_processing_service import LinkProcessingService
+from src.services.ytdlp_service import YtDlpService
 
 # Настройка логирования
 logging.basicConfig(
@@ -45,15 +48,27 @@ except ValueError:
 session = AiohttpSession(timeout=600)
 bot = Bot(token=BOT_TOKEN, session=session)
 db = Database()
-downloader = VideoDownloader()
+downloader = VideoDownloader()  # Для обратной совместимости (будет удален)
+service_factory = ServiceFactory(downloader)
+link_processor = LinkProcessingService(service_factory)
+ytdlp_service = YtDlpService()
 
 
 async def process_download_task(task: dict) -> Optional[int]:
     """
-    Обработать задачу на скачивание видео
+    Worker - тупой исполнитель
+    
+    Алгоритм:
+    1. Берет DownloadTask из очереди
+    2. Получает LinkInfo через LinkProcessingService
+    3. Получает DownloadPlan через PlatformService
+    4. Исполняет DownloadPlan через YtDlpService
+    5. Загружает в Telegram канал
+    6. Сохраняет file_id в Redis
+    7. Публикует событие VIDEO_READY
     
     Args:
-        task: Словарь с задачей (url, video_id, platform)
+        task: Словарь с задачей (url, video_id, platform, quality, format_id)
         
     Returns:
         message_id или None при ошибке
@@ -61,18 +76,17 @@ async def process_download_task(task: dict) -> Optional[int]:
     url = task.get('url')
     video_id = task.get('video_id')
     platform = task.get('platform')
+    quality = task.get('quality')
+    format_id = task.get('format_id')
     
-    logger.info(f"[worker] Начало обработки задачи: url={url}, video_id={video_id}")
+    logger.info(f"[worker] Начало обработки задачи: url={url}, video_id={video_id}, quality={quality}, format_id={format_id}")
     
     if not url or not video_id:
         logger.error(f"[worker] Невалидная задача: {task}")
         return None
     
-    # Извлекаем качество и format_id из задачи
-    quality = task.get('quality')
-    format_id = task.get('format_id')
-    
     # Пытаемся получить lock на скачивание (с учетом качества)
+    # ВАЖНО: Lock должен быть получен ДО входа в try, чтобы finally мог его освободить
     got_lock = await db.acquire_download_lock(video_id, quality=quality)
     
     if not got_lock:
@@ -80,38 +94,70 @@ async def process_download_task(task: dict) -> Optional[int]:
         logger.info(f"[worker] Lock занят для video_id={video_id}, quality={quality}, пропускаем задачу (кто-то уже скачивает)")
         return None
     
+    # Lock получен - обрабатываем задачу
+    # ВАЖНО: Все return None внутри try будут освобождать lock в finally
     try:
         # Проверяем кэш еще раз (на случай если пока ждали lock, видео уже скачали)
-        # Если указано качество, проверяем кэш для этого качества
         cached_message_id = await db.get_cached_message_id(video_id=video_id, quality=quality)
         if cached_message_id and cached_message_id != 0:
             logger.info(f"[worker] Видео уже в кэше: video_id={video_id}, quality={quality}, message_id={cached_message_id}")
             return cached_message_id
         
-        # Скачиваем видео напрямую в поток (без сохранения на диск для маленьких файлов)
-        logger.info(f"[worker] Начало потокового скачивания: url={url}, video_id={video_id}, quality={quality}, format_id={format_id}")
-        
-        # Используем новый метод потокового скачивания
-        try:
-            stream_result = downloader.download_video_stream(url, format_id=format_id)
-        except Exception as e:
-            logger.error(f"[worker] Исключение при вызове download_video_stream: {e}", exc_info=True)
+        # 1. Получаем LinkInfo через LinkProcessingService (мозг системы)
+        logger.info(f"[worker] Получаю LinkInfo для URL: {url}")
+        link_info = link_processor.process_link(url)
+        if not link_info:
+            logger.error(f"[worker] Не удалось обработать ссылку: {url}")
+            # Публикуем событие об ошибке, чтобы пользователь получил уведомление
+            await db.publish_video_download_event(video_id, 'failed')
             return None
         
-        if not stream_result:
+        # 2. Получаем DownloadPlan через PlatformService
+        logger.info(f"[worker] Получаю DownloadPlan для платформы: {link_info.platform}")
+        download_plan = link_info.service.build_download_plan(
+            url=link_info.normalized_url,
+            quality=quality,
+            format_id=format_id
+        )
+        if not download_plan:
+            logger.error(f"[worker] Не удалось построить DownloadPlan для: {url}")
+            logger.error(f"[worker] Возможные причины:")
+            logger.error(f"  - Видео недоступно или удалено")
+            logger.error(f"  - Видео приватное или требует авторизацию (Instagram/TikTok)")
+            logger.error(f"  - Контент недоступен для определенной аудитории")
+            logger.error(f"  - Проблемы с доступом к платформе")
+            # Публикуем событие об ошибке, чтобы пользователь получил уведомление
+            await db.publish_video_download_event(video_id, 'failed')
+            return None
+        
+        logger.info(f"[worker] DownloadPlan создан: platform={download_plan.platform}, streamable={download_plan.streamable}")
+        
+        # 3. Исполняем DownloadPlan через YtDlpService
+        # ВАЖНО: Всегда скачиваем напрямую в память (download_to_stream), не на диск
+        logger.info(f"[worker] Исполняю DownloadPlan через YtDlpService (прямое скачивание в память)")
+        result = ytdlp_service.download_to_stream(download_plan)
+        
+        # Если потоковое скачивание не сработало, пробуем через файл (fallback)
+        if not result:
+            logger.warning(f"[worker] Потоковое скачивание не удалось, пробую через файл (fallback)")
+            result = ytdlp_service.download_to_file(download_plan)
+        
+        if not result:
             logger.error(f"[worker] ❌ Не удалось скачать видео: url={url}")
             logger.error(f"[worker] Возможные причины:")
             logger.error(f"  - Видео недоступно или удалено")
             logger.error(f"  - Видео приватное (Instagram/TikTok)")
             logger.error(f"  - Проблемы с сетью или доступом к платформе")
             logger.error(f"  - yt-dlp не может обработать этот тип контента")
+            # Публикуем событие об ошибке, чтобы пользователь получил уведомление
+            await db.publish_video_download_event(video_id, 'failed')
             return None
         
-        video_data, file_size, filename = stream_result
+        video_data, file_size, filename = result
         file_size_mb = file_size / (1024 * 1024)
         logger.info(f"[worker] Размер файла: {file_size_mb:.2f} MB")
         
-        # Отправляем видео в канал
+        # 4. Загружаем в Telegram канал
         # Для маленьких файлов (<50MB) - используем BufferedInputFile (из памяти)
         # Для больших файлов - используем FSInputFile (временный файл)
         try:
@@ -149,20 +195,20 @@ async def process_download_task(task: dict) -> Optional[int]:
                 except Exception as e:
                     logger.warning(f"[worker] Не удалось удалить временный файл {video_data}: {e}")
         
-        # Получаем file_id из видео
+        # 5. Получаем file_id из видео
         file_id = None
         if message.video:
             file_id = message.video.file_id
         elif message.document:
             file_id = message.document.file_id
         
-        # Сохраняем в кэш с указанием качества (если указано)
-        platform = platform or get_platform(url)
+        # 6. Сохраняем в кэш с указанием качества (если указано)
+        platform = platform or download_plan.platform
         await db.save_to_cache(video_id, message_id, platform, file_id, original_url=url, quality=quality)
         
         logger.info(f"[worker] ✅ Видео успешно скачано и сохранено в кэш: video_id={video_id}, message_id={message_id}")
         
-        # Публикуем событие о завершении скачивания (для wait_for_download)
+        # 7. Публикуем событие о завершении скачивания (для wait_for_download)
         await db.publish_video_download_event(video_id, 'completed', message_id, file_id)
         
         # Публикуем событие DownloadCompletedEvent в очередь аналитики

@@ -21,8 +21,11 @@ from aiogram.exceptions import TelegramBadRequest
 
 from src.database.redis_db import Database
 from src.downloader.downloader import VideoDownloader
-from src.utils.utils import normalize_url, is_supported_url, is_youtube_video, get_video_id_fast
+from src.downloader.download_manager import DownloadManager
+from src.utils.utils import normalize_url, is_supported_url, is_youtube_video, get_video_id_fast, get_platform
 from src.services import LinkProcessingService
+from src.services.service_factory import ServiceFactory
+from src.models.download_response import DownloadResponse
 from src.use_cases import (
     HandleInlineQueryUseCase,
     HandleStartUseCase,
@@ -49,6 +52,8 @@ if not CHANNEL_ID:
         "Создайте .env файл с TELEGRAM_CHANNEL_ID=ваш_id_канала\n"
         "ID канала можно получить через @userinfobot или @RawDataBot"
     )
+if not BOT_USERNAME:
+    raise ValueError("BOT_USERNAME не найден в .env файле!")
 
 # Преобразуем CHANNEL_ID в int, если это число
 try:
@@ -63,10 +68,12 @@ dp = Dispatcher()
 
 # Инициализация зависимостей
 db = Database()
-downloader = VideoDownloader()
+downloader = VideoDownloader()  # Для обратной совместимости (будет удален)
 
 # Инициализация сервисов
-link_processing_service = LinkProcessingService(db, downloader)
+service_factory = ServiceFactory(downloader)
+link_processing_service = LinkProcessingService(service_factory)
+download_manager = DownloadManager(db, link_processing_service)
 
 # Инициализация use-cases (для специфичных задач)
 handle_inline_query_use_case = HandleInlineQueryUseCase(db, downloader)
@@ -120,7 +127,7 @@ async def send_error(chat_id: int, reason: str):
     error_messages = {
         'unsupported_platform': "❌ Неподдерживаемая платформа.\nПоддерживаются: YouTube, Instagram, TikTok",
         'video_not_found': f"❌ Видео не найдено. Попробуй снова через inline-запрос {BOT_USERNAME}",
-        'download_failed': "❌ Не удалось скачать видео за отведенное время. Попробуй позже.",
+        'download_failed': "❌ Не удалось скачать видео.\n\nВозможные причины:\n• Видео недоступно или удалено\n• Видео приватное или требует авторизацию\n• Контент недоступен для скачивания\n• Проблемы с доступом к платформе\n\nПопробуй позже или проверь ссылку.",
         'service_unavailable': "❌ Сервис временно недоступен. Попробуй позже.",
         'generic': "❌ Произошла ошибка при отправке видео. Файл слишком большой или проблема с интернетом."
     }
@@ -265,11 +272,28 @@ async def message_handler(message: types.Message):
         if not video_id:
             video_id = normalized_url
         
-        # Получаем доступные форматы
-        quality_info = await link_processing_service.get_available_qualities(
-            normalized_url,
-            video_id
-        )
+        # Получаем доступные форматы через YouTubeService
+        youtube_service = service_factory.get_service('youtube')
+        formats = youtube_service.get_available_formats(normalized_url) if youtube_service else None
+        
+        # Формируем quality_info для совместимости
+        quality_info = None
+        if formats:
+            # Проверяем, какие качества есть в кэше
+            cached_qualities = []
+            for quality_label in ['480p', '720p', '1080p', 'audio']:
+                if quality_label in formats:
+                    try:
+                        cached = await db.check_quality_in_cache(video_id, quality_label)
+                        if cached:
+                            cached_qualities.append(quality_label)
+                    except Exception as e:
+                        logger.error(f"Ошибка при проверке качества в кэше: {e}")
+            
+            quality_info = {
+                'formats': formats,
+                'cached_qualities': cached_qualities
+            }
         
         if quality_info and quality_info.get('formats'):
             # Сохраняем URL в маппинг
@@ -443,110 +467,120 @@ async def callback_quality_handler(callback: CallbackQuery):
     
     await callback.answer(f"⏳ Скачиваю {quality_label}...")
     
-    # Получаем информацию о формате
-    format_info = await link_processing_service.get_quality_info(
-        normalized_url,
-        quality_label
-    )
+    # Получаем информацию о формате через YouTubeService
+    youtube_service = service_factory.get_service('youtube')
+    if not youtube_service:
+        await callback.message.edit_text("❌ Ошибка: сервис YouTube недоступен")
+        return
     
-    if not format_info:
+    formats = youtube_service.get_available_formats(normalized_url)
+    if not formats or quality_label not in formats:
         await callback.message.edit_text("❌ Выбранное качество недоступно")
         return
     
-    format_id = format_info['format_id']
+    format_info = formats[quality_label]
+    format_id = format_info.get('format_id')
     
     # Проверяем кэш для этого качества
-    cached_result = await link_processing_service.get_cached_quality(
-        video_id,
-        quality_label
-    )
+    cached_message_id = await db.get_cached_message_id(video_id=video_id, quality=quality_label)
+    cached_file_id = None
+    if cached_message_id and cached_message_id != 0:
+        cached_file_id = await db.get_cached_file_id(video_id=video_id, quality=quality_label)
     
-    if cached_result:
+    if cached_message_id and cached_message_id != 0:
         # Видео уже в кэше
         try:
             await callback.message.delete()
         except:
             pass
         
-        success = await send_video(callback.message.chat.id, cached_result['message_id'])
+        success = await send_video(callback.message.chat.id, cached_message_id)
         if success:
             # Публикуем событие
-            await link_processing_service.publish_download_analytics(
-                callback.from_user.id,
-                video_id,
-                'youtube',
-                'message'
-            )
+            try:
+                from src.events.events import DownloadCompletedEvent
+                event = DownloadCompletedEvent(
+                    user_id=callback.from_user.id,
+                    video_id=video_id,
+                    platform='youtube',
+                    source='message'
+                )
+                await db.add_analytics_event(event.to_json())
+            except Exception as e:
+                logger.error(f"Ошибка при публикации события аналитики: {e}")
         else:
             # Видео не найдено в канале - удаляем из кэша и скачиваем заново
             await db.delete_from_cache(video_id=video_id, quality=quality_label)
-            cached_result = None
+            cached_message_id = None
     
-    # Видео нет в кэше - скачиваем
-    if not cached_result:
+    # Видео нет в кэше - скачиваем через DownloadManager
+    if not cached_message_id or cached_message_id == 0:
         await callback.message.edit_text(f"⏳ Скачиваю {quality_label}...")
         
-        # Обрабатываем ссылку через сервис
-        result = await link_processing_service.process_link(
-            normalized_url,
-            callback.from_user.id,
-            'message',
-            quality_label,
-            format_id
+        # Запрашиваем скачивание через DownloadManager
+        response = await download_manager.request_download(
+            user_id=callback.from_user.id,
+            url=normalized_url,
+            source='message',
+            quality=quality_label,
+            format_id=format_id
         )
         
-        if result['status'] == 'error':
-            await send_error(callback.message.chat.id, result.get('error', 'generic'))
+        if response.is_error():
+            await send_error(callback.message.chat.id, 'generic')
+            if response.error:
+                logger.error(f"Ошибка при запросе скачивания: {response.error}")
             return
         
-        if result['status'] == 'processing':
-            # Пользователь уже обрабатывает это видео
-            await callback.message.edit_text(result.get('message', '⏳ Видео уже обрабатывается...'))
-            return
-        
-        if result['status'] == 'cached':
+        if response.is_ready():
             # Видео появилось в кэше
             try:
                 await callback.message.delete()
             except:
                 pass
-            success = await send_video(callback.message.chat.id, result['message_id'])
+            success = await send_video(callback.message.chat.id, response.message_id)
             if success:
-                await link_processing_service.publish_download_analytics(
-                    callback.from_user.id,
-                    result['video_id'],
-                    'youtube',
-                    'message'
-                )
+                try:
+                    from src.events.events import DownloadCompletedEvent
+                    event = DownloadCompletedEvent(
+                        user_id=callback.from_user.id,
+                        video_id=response.job_id or video_id,
+                        platform='youtube',
+                        source='message'
+                    )
+                    await db.add_analytics_event(event.to_json())
+                except Exception as e:
+                    logger.error(f"Ошибка при публикации события аналитики: {e}")
             return
         
-        # Ждем завершения скачивания
-        message_id = await link_processing_service.wait_for_download_completion(
-            result['video_id'],
-            callback.from_user.id,
-            timeout=1800.0,
-            quality=quality_label
-        )
-        
-        if message_id:
-            try:
-                await callback.message.delete()
-            except:
-                pass
+        if response.is_in_progress() or response.is_queued():
+            # Ждем завершения скачивания
+            message_id = await db.wait_for_download(response.job_id or video_id, timeout=1800.0, quality=quality_label)
             
-            success = await send_video(callback.message.chat.id, message_id)
-            if success:
-                # Публикуем событие
-                await link_processing_service.publish_download_analytics(
-                    callback.from_user.id,
-                    video_id,
-                    'youtube',
-                    'message'
-                )
+            if message_id:
+                try:
+                    await callback.message.delete()
+                except:
+                    pass
+                
+                success = await send_video(callback.message.chat.id, message_id)
+                if success:
+                    # Публикуем событие
+                    try:
+                        from src.events.events import DownloadCompletedEvent
+                        event = DownloadCompletedEvent(
+                            user_id=callback.from_user.id,
+                            video_id=response.job_id or video_id,
+                            platform='youtube',
+                            source='message'
+                        )
+                        await db.add_analytics_event(event.to_json())
+                    except Exception as e:
+                        logger.error(f"Ошибка при публикации события аналитики: {e}")
+                else:
+                    await send_error(callback.message.chat.id, 'generic')
             else:
-                await send_error(callback.message.chat.id, 'generic')
-        else:
-            await send_error(callback.message.chat.id, 'download_failed')
+                await send_error(callback.message.chat.id, 'download_failed')
 
 
 @dp.callback_query(F.data.startswith("resend:"))
@@ -560,13 +594,23 @@ async def callback_resend_handler(callback: CallbackQuery):
     chat_id = callback.message.chat.id if callback.message else callback.from_user.id
     
     try:
-        cached_result = await link_processing_service.get_cached_video(normalized_url)
-        
-        if not cached_result:
+        # Получаем video_id для проверки кэша
+        link_info = link_processing_service.process_link(normalized_url)
+        if not link_info:
             await send_error(chat_id, 'video_not_found')
             return
         
-        success = await send_cached_video_from_result(chat_id, cached_result)
+        video_id = link_info.video_id
+        
+        # Проверяем кэш
+        cached_message_id = await db.get_cached_message_id(video_id=video_id, url=normalized_url)
+        if not cached_message_id or cached_message_id == 0:
+            await send_error(chat_id, 'video_not_found')
+            return
+        
+        cached_file_id = await db.get_cached_file_id(video_id=video_id, url=normalized_url)
+        
+        success = await send_video(chat_id, cached_message_id)
         
         if not success:
             await send_error(chat_id, 'video_not_found')
@@ -588,10 +632,12 @@ async def process_video_download(
     chat_id: int,
     status_msg: types.Message,
     user_id: int,
-    source: str
+    source: str,
+    quality: Optional[str] = None,
+    format_id: Optional[str] = None
 ):
     """
-    Обработать скачивание видео через LinkProcessingService
+    Обработать скачивание видео через DownloadManager
     
     Args:
         url: URL видео
@@ -599,61 +645,111 @@ async def process_video_download(
         status_msg: Сообщение со статусом для удаления
         user_id: ID пользователя
         source: Источник запроса
+        quality: Качество видео (для YouTube) или None
+        format_id: ID формата (для YouTube) или None
     """
     try:
-        # Обрабатываем ссылку через сервис
-        result = await link_processing_service.process_link(url, user_id, source)
-        
-        if result['status'] == 'error':
-            await edit_or_delete_wait_message(status_msg)
-            await send_error(chat_id, result.get('error', 'generic'))
-            return
-        
-        if result['status'] == 'processing':
-            # Пользователь уже обрабатывает это видео
-            await edit_or_delete_wait_message(status_msg)
-            await bot.send_message(chat_id, result.get('message', '⏳ Видео уже обрабатывается, пожалуйста подождите...'))
-            return
-        
-        if result['status'] == 'cached':
-            # Видео в кэше - отправляем сразу
-            await edit_or_delete_wait_message(status_msg)
-            success = await send_cached_video_from_result(chat_id, result)
-            
-            if success:
-                # Публикуем событие
-                from src.utils.utils import get_platform
-                platform = get_platform(url)
-                await link_processing_service.publish_download_analytics(
-                    user_id,
-                    result['video_id'],
-                    platform,
-                    source
-                )
-            return
-        
-        # Видео добавлено в очередь - ждем завершения
-        message_id = await link_processing_service.wait_for_download_completion(
-            result['video_id'],
-            user_id,
-            timeout=1800.0
+        # Запрашиваем скачивание через DownloadManager
+        response = await download_manager.request_download(
+            user_id=user_id,
+            url=url,
+            source=source,
+            quality=quality,
+            format_id=format_id
         )
         
-        await edit_or_delete_wait_message(status_msg)
+        if response.is_error():
+            await edit_or_delete_wait_message(status_msg)
+            await send_error(chat_id, 'generic')
+            if response.error:
+                logger.error(f"Ошибка при запросе скачивания: {response.error}")
+            return
         
-        if message_id:
-            success = await send_video(chat_id, message_id)
+        if response.is_ready():
+            # Видео уже готово в кэше - отправляем сразу
+            await edit_or_delete_wait_message(status_msg)
+            success = await send_video(chat_id, response.message_id)
+            
             if success:
-                await link_processing_service.publish_download_analytics(
-                    user_id,
-                    result['video_id'],
-                    result.get('platform', get_platform(url)),
-                    source
-                )
+                # Публикуем событие аналитики
+                platform = get_platform(url)
+                # TODO: Добавить метод publish_download_analytics в DownloadManager или использовать напрямую db
+                try:
+                    from src.events.events import DownloadCompletedEvent
+                    event = DownloadCompletedEvent(
+                        user_id=user_id,
+                        video_id=response.job_id or url,  # Используем job_id как video_id
+                        platform=platform,
+                        source=source
+                    )
+                    await db.add_analytics_event(event.to_json())
+                except Exception as e:
+                    logger.error(f"Ошибка при публикации события аналитики: {e}")
             else:
                 await send_error(chat_id, 'generic')
-        else:
-            await send_error(chat_id, 'download_failed')
+            return
+        
+        if response.is_in_progress():
+            # Видео уже скачивается другим пользователем
+            await edit_or_delete_wait_message(status_msg)
+            await bot.send_message(chat_id, "⏳ Видео уже обрабатывается, пожалуйста подождите...")
+            # Ждем завершения
+            message_id = await db.wait_for_download(response.job_id, timeout=1800.0, quality=quality)
+            if message_id:
+                success = await send_video(chat_id, message_id)
+                if success:
+                    # Публикуем событие
+                    platform = get_platform(url)
+                    try:
+                        from src.events.events import DownloadCompletedEvent
+                        event = DownloadCompletedEvent(
+                            user_id=user_id,
+                            video_id=response.job_id,
+                            platform=platform,
+                            source=source
+                        )
+                        await db.add_analytics_event(event.to_json())
+                    except Exception as e:
+                        logger.error(f"Ошибка при публикации события аналитики: {e}")
+                else:
+                    await send_error(chat_id, 'generic')
+            else:
+                await send_error(chat_id, 'download_failed')
+            return
+        
+        if response.is_queued():
+            # Видео добавлено в очередь - ждем завершения
+            await edit_or_delete_wait_message(status_msg)
+            await bot.send_message(chat_id, "⏳ Скачиваю видео...")
+            
+            message_id = await db.wait_for_download(response.job_id, timeout=1800.0, quality=quality)
+            
+            if message_id:
+                success = await send_video(chat_id, message_id)
+                if success:
+                    # Публикуем событие
+                    platform = get_platform(url)
+                    try:
+                        from src.events.events import DownloadCompletedEvent
+                        event = DownloadCompletedEvent(
+                            user_id=user_id,
+                            video_id=response.job_id,
+                            platform=platform,
+                            source=source
+                        )
+                        await db.add_analytics_event(event.to_json())
+                    except Exception as e:
+                        logger.error(f"Ошибка при публикации события аналитики: {e}")
+                else:
+                    await send_error(chat_id, 'generic')
+            else:
+                await send_error(chat_id, 'download_failed')
+            return
+        
+        # Неожиданный статус
+        logger.warning(f"Неожиданный статус DownloadResponse: {response.status}")
+        await edit_or_delete_wait_message(status_msg)
+        await send_error(chat_id, 'generic')
             
     except Exception as e:
         logger.error(f"Ошибка при обработке скачивания видео: {e}", exc_info=True)

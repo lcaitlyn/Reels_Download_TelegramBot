@@ -79,7 +79,14 @@ async def stats_active_users(days: int = Query(7, ge=1, le=365)):
 
 
 if __name__ == "__main__":
+    import sys
     import uvicorn
+    
+    # Добавляем корневую директорию в PYTHONPATH для прямого запуска
+    import pathlib
+    project_root = pathlib.Path(__file__).parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
-    uvicorn.run("dashboard:app", host="0.0.0.0", port=int(os.getenv("DASHBOARD_PORT", "8000")), reload=False)
+    uvicorn.run("src.dashboard.dashboard:app", host="0.0.0.0", port=int(os.getenv("DASHBOARD_PORT", "8000")), reload=False)
 
