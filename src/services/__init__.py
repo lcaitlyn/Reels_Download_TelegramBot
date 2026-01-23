@@ -5,5 +5,6 @@ from .base import BaseService
 from .instagram import InstagramService
 from .tiktok import TikTokService
 from .youtube import YouTubeService
+from .link_processing_service import LinkProcessingService
 
-__all__ = ['BaseService', 'InstagramService', 'TikTokService', 'YouTubeService']
+__all__ = ['BaseService', 'InstagramService', 'TikTokService', 'YouTubeService', 'LinkProcessingService']

@@ -92,10 +92,19 @@ async def process_download_task(task: dict) -> Optional[int]:
         logger.info(f"[worker] Начало потокового скачивания: url={url}, video_id={video_id}, quality={quality}, format_id={format_id}")
         
         # Используем новый метод потокового скачивания
-        stream_result = downloader.download_video_stream(url, format_id=format_id)
+        try:
+            stream_result = downloader.download_video_stream(url, format_id=format_id)
+        except Exception as e:
+            logger.error(f"[worker] Исключение при вызове download_video_stream: {e}", exc_info=True)
+            return None
         
         if not stream_result:
-            logger.error(f"[worker] Не удалось скачать видео: url={url}")
+            logger.error(f"[worker] ❌ Не удалось скачать видео: url={url}")
+            logger.error(f"[worker] Возможные причины:")
+            logger.error(f"  - Видео недоступно или удалено")
+            logger.error(f"  - Видео приватное (Instagram/TikTok)")
+            logger.error(f"  - Проблемы с сетью или доступом к платформе")
+            logger.error(f"  - yt-dlp не может обработать этот тип контента")
             return None
         
         video_data, file_size, filename = stream_result

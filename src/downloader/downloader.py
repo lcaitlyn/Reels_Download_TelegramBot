@@ -283,11 +283,44 @@ class VideoDownloader:
             logger.info(f"Начинаю потоковое скачивание: {url} (формат: {format_selector})")
             
             # Получаем информацию о видео для определения размера
-            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': False}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                video_id = info.get('id', 'video')
-                filesize = info.get('filesize') or info.get('filesize_approx')
-                ext = info.get('ext', 'mp4') or 'mp4'
+            info_opts = {'quiet': True, 'extract_flat': False}
+            
+            # Специальные опции для Instagram
+            if platform == 'instagram':
+                info_opts['quiet'] = False  # Включаем вывод для отладки
+                info_opts['no_warnings'] = False
+                try:
+                    info_opts['extractor_args'] = {'instagram': {'webpage_download': False}}
+                except:
+                    pass
+            
+            try:
+                with yt_dlp.YoutubeDL(info_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    video_id = info.get('id', 'video')
+                    filesize = info.get('filesize') or info.get('filesize_approx')
+                    ext = info.get('ext', 'mp4') or 'mp4'
+                    
+                    # Проверяем доступность видео для Instagram
+                    if platform == 'instagram':
+                        if not info or not info.get('url'):
+                            logger.error("[Instagram] ❌ Не удалось получить информацию о видео. Возможные причины:")
+                            logger.error("  - Видео приватное или требует авторизацию")
+                            logger.error("  - Видео удалено или недоступно")
+                            logger.error("  - Instagram заблокировал доступ")
+                            return None
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                logger.error(f"❌ yt-dlp DownloadError при получении информации о видео: {error_msg}")
+                if platform == 'instagram':
+                    if 'login' in error_msg.lower() or 'private' in error_msg.lower():
+                        logger.error("[Instagram] ⚠️ Видео приватное или требует авторизацию")
+                    elif 'unavailable' in error_msg.lower() or 'not found' in error_msg.lower():
+                        logger.error("[Instagram] ⚠️ Видео недоступно или удалено")
+                return None
+            except Exception as e:
+                logger.error(f"❌ Ошибка при получении информации о видео: {e}", exc_info=True)
+                return None
                 
                 if filesize:
                     filesize_mb = filesize / (1024 * 1024)
@@ -375,18 +408,35 @@ class VideoDownloader:
                     
                     # Специальные опции для Instagram
                     if platform == 'instagram':
-                        ydl_opts['quiet'] = True  # Для Instagram лучше тихо
+                        ydl_opts['quiet'] = False  # Включаем вывод для отладки Instagram
+                        ydl_opts['no_warnings'] = False  # Показываем предупреждения
                         # Instagram может требовать дополнительные опции
                         try:
                             ydl_opts['extractor_args'] = {'instagram': {'webpage_download': False}}
                         except:
                             pass
+                        # Добавляем опции для обхода ограничений Instagram
+                        ydl_opts['cookiefile'] = None  # Можно указать путь к cookies файлу
+                        ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     
                     try:
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            # Логируем детальную информацию для Instagram
+                            if platform == 'instagram':
+                                logger.info(f"[Instagram] Пытаюсь скачать: {url}")
+                                logger.info(f"[Instagram] Опции yt-dlp: {ydl_opts}")
+                            
                             ydl.download([url])
+                    except yt_dlp.utils.DownloadError as e:
+                        error_msg = str(e)
+                        logger.error(f"❌ yt-dlp DownloadError при скачивании {url}: {error_msg}")
+                        if platform == 'instagram':
+                            logger.error(f"[Instagram] Детали ошибки: {error_msg}")
+                            # Instagram часто требует аутентификацию
+                            if 'login' in error_msg.lower() or 'private' in error_msg.lower():
+                                logger.error("[Instagram] ⚠️ Видео может быть приватным или требовать авторизацию")
                     except Exception as e:
-                        logger.warning(f"Ошибка при скачивании с основным форматом {format_selector}: {e}")
+                        logger.error(f"❌ Неожиданная ошибка при скачивании {url}: {e}", exc_info=True)
                         # Пробуем альтернативный формат
                         pass
                     
@@ -446,17 +496,33 @@ class VideoDownloader:
                     
                     # Специальные опции для Instagram
                     if platform == 'instagram':
-                        ydl_opts['quiet'] = True  # Для Instagram лучше тихо
+                        ydl_opts['quiet'] = False  # Включаем вывод для отладки Instagram
+                        ydl_opts['no_warnings'] = False  # Показываем предупреждения
                         try:
                             ydl_opts['extractor_args'] = {'instagram': {'webpage_download': False}}
                         except:
                             pass
+                        # Добавляем опции для обхода ограничений Instagram
+                        ydl_opts['cookiefile'] = None  # Можно указать путь к cookies файлу
+                        ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     
                     try:
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            # Логируем детальную информацию для Instagram
+                            if platform == 'instagram':
+                                logger.info(f"[Instagram] Пытаюсь скачать: {url}")
+                            
                             ydl.download([url])
+                    except yt_dlp.utils.DownloadError as e:
+                        error_msg = str(e)
+                        logger.error(f"❌ yt-dlp DownloadError при скачивании {url}: {error_msg}")
+                        if platform == 'instagram':
+                            logger.error(f"[Instagram] Детали ошибки: {error_msg}")
+                            # Instagram часто требует аутентификацию
+                            if 'login' in error_msg.lower() or 'private' in error_msg.lower():
+                                logger.error("[Instagram] ⚠️ Видео может быть приватным или требовать авторизацию")
                     except Exception as e:
-                        logger.warning(f"Ошибка при скачивании с основным форматом {format_selector}: {e}")
+                        logger.error(f"❌ Неожиданная ошибка при скачивании {url}: {e}", exc_info=True)
                         # Пробуем альтернативный формат
                         pass
                     
@@ -481,12 +547,23 @@ class VideoDownloader:
                                 if file_size > 0:
                                     logger.info(f"✅ Успешно скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
                                     break
+                            except yt_dlp.utils.DownloadError as e:
+                                error_msg = str(e)
+                                logger.warning(f"❌ yt-dlp DownloadError с форматом {alt_format}: {error_msg}")
+                                if platform == 'instagram' and ('login' in error_msg.lower() or 'private' in error_msg.lower()):
+                                    logger.error("[Instagram] ⚠️ Видео приватное или требует авторизацию - прекращаю попытки")
+                                    break
                             except Exception as e:
                                 logger.warning(f"Ошибка при скачивании с форматом {alt_format}: {e}")
                                 continue
                         
                         if file_size == 0:
                             logger.error("❌ Не удалось скачать видео ни с одним форматом")
+                            if platform == 'instagram':
+                                logger.error("[Instagram] Возможные причины:")
+                                logger.error("  - Видео приватное или требует авторизацию")
+                                logger.error("  - Видео удалено или недоступно")
+                                logger.error("  - Instagram заблокировал доступ (нужны cookies)")
                             try:
                                 os.remove(tmp_path)
                             except:
