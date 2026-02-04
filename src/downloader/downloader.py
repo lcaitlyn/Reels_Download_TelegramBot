@@ -7,6 +7,7 @@ DEPRECATED: Этот модуль будет удален после рефак�
 """
 import os
 import logging
+import time
 import yt_dlp
 from typing import Optional, Dict, Any
 
@@ -55,9 +56,16 @@ class VideoDownloader:
             ydl_opts = {'quiet': True, 'extract_flat': False}
         
         try:
+            start_time = time.time()
+            logger.info(f"[extract_info] Начало получения информации: {url}")
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                return info
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"[extract_info] Информация получена за {elapsed_time:.2f} сек: {url}")
+            
+            return info
         except Exception as e:
             logger.error(f"Ошибка при получении информации о видео {url}: {e}", exc_info=True)
             return None
@@ -81,16 +89,23 @@ class VideoDownloader:
                 'extract_flat': False,
             }
             
+            start_time = time.time()
+            logger.info(f"[extract_info] Начало получения video_id: {url}")
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                video_id = info.get('id')
-                platform = info.get('extractor_key', 'unknown').lower()
-                
-                if video_id and platform:
-                    # Возвращаем в формате "platform:video_id" для уникальности (основной формат в БД)
-                    canonical_id = f"{platform}:{video_id}"
-                    logger.info(f"Канонический ID для {url}: {canonical_id}")
-                    return canonical_id
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"[extract_info] video_id получен за {elapsed_time:.2f} сек: {url}")
+            
+            video_id = info.get('id')
+            platform = info.get('extractor_key', 'unknown').lower()
+            
+            if video_id and platform:
+                # Возвращаем в формате "platform:video_id" для уникальности (основной формат в БД)
+                canonical_id = f"{platform}:{video_id}"
+                logger.info(f"Канонический ID для {url}: {canonical_id}")
+                return canonical_id
                     
         except Exception as e:
             logger.warning(f"Не удалось получить канонический ID для {url}: {e}")
@@ -129,119 +144,126 @@ class VideoDownloader:
         try:
             formats_dict = {}
             
+            start_time = time.time()
+            logger.info(f"[extract_info] Начало получения информации о форматах: {url}")
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                formats = info.get('formats', [])
                 
-                # Ищем видео форматы по разрешению
-                video_formats = {}
-                audio_formats = []
+            elapsed_time = time.time() - start_time
+            logger.info(f"[extract_info] Информация о форматах получена за {elapsed_time:.2f} сек: {url}")
+            
+            formats = info.get('formats', [])
+            
+            # Ищем видео форматы по разрешению
+            video_formats = {}
+            audio_formats = []
+            
+            for fmt in formats:
+                height = fmt.get('height')
+                vcodec = fmt.get('vcodec', 'none')
+                acodec = fmt.get('acodec', 'none')
+                format_id = fmt.get('format_id')
+                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+                ext = fmt.get('ext', 'mp4')
                 
-                for fmt in formats:
-                    height = fmt.get('height')
-                    vcodec = fmt.get('vcodec', 'none')
-                    acodec = fmt.get('acodec', 'none')
-                    format_id = fmt.get('format_id')
-                    filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                    ext = fmt.get('ext', 'mp4')
-                    
-                    # Аудио формат (только аудио, без видео)
-                    if vcodec == 'none' and acodec != 'none' and ext in ['m4a', 'webm', 'mp3']:
-                        audio_formats.append({
-                            'format_id': format_id,
-                            'filesize': filesize,
-                            'ext': ext
-                        })
-                    
-                    # Видео форматы (с видео кодеком)
-                    # ВАЖНО: сохраняем информацию о наличии аудио
-                    if vcodec != 'none' and height:
-                        if height not in video_formats:
-                            video_formats[height] = []
-                        video_formats[height].append({
-                            'format_id': format_id,
-                            'filesize': filesize,
-                            'ext': ext,
-                            'height': height,
-                            'has_audio': acodec != 'none'  # Есть ли аудио в этом формате
-                        })
+                # Аудио формат (только аудио, без видео)
+                if vcodec == 'none' and acodec != 'none' and ext in ['m4a', 'webm', 'mp3']:
+                    audio_formats.append({
+                        'format_id': format_id,
+                        'filesize': filesize,
+                        'ext': ext
+                    })
                 
-                # Выбираем лучшие форматы для каждого разрешения
-                # ВАЖНО: выбираем только форматы с видео+аудио (не video only)
-                target_heights = [480, 720, 1080]
-                for target_height in target_heights:
-                    # Ищем ближайшее разрешение
-                    closest_height = None
-                    min_diff = float('inf')
+                # Видео форматы (с видео кодеком)
+                # ВАЖНО: сохраняем информацию о наличии аудио
+                if vcodec != 'none' and height:
+                    if height not in video_formats:
+                        video_formats[height] = []
+                    video_formats[height].append({
+                        'format_id': format_id,
+                        'filesize': filesize,
+                        'ext': ext,
+                        'height': height,
+                        'has_audio': acodec != 'none'  # Есть ли аудио в этом формате
+                    })
+            
+            # Выбираем лучшие форматы для каждого разрешения
+            # ВАЖНО: выбираем только форматы с видео+аудио (не video only)
+            target_heights = [480, 720, 1080]
+            for target_height in target_heights:
+                # Ищем ближайшее разрешение
+                closest_height = None
+                min_diff = float('inf')
+                
+                for height in video_formats.keys():
+                    if height and height <= target_height:
+                        diff = target_height - height
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_height = height
+                
+                if closest_height:
+                    # Фильтруем форматы: выбираем только те, которые содержат и видео, и аудио
+                    # Приоритет: форматы с аудио > video only
+                    formats_with_audio = [f for f in video_formats[closest_height] if f.get('has_audio', False)]
                     
-                    for height in video_formats.keys():
-                        if height and height <= target_height:
-                            diff = target_height - height
-                            if diff < min_diff:
-                                min_diff = diff
-                                closest_height = height
-                    
-                    if closest_height:
-                        # Фильтруем форматы: выбираем только те, которые содержат и видео, и аудио
-                        # Приоритет: форматы с аудио > video only
-                        formats_with_audio = [f for f in video_formats[closest_height] if f.get('has_audio', False)]
+                    if formats_with_audio:
+                        # Выбираем формат с наименьшим размером файла среди форматов с аудио
+                        best_format = min(formats_with_audio, 
+                                        key=lambda x: x['filesize'] if x['filesize'] else float('inf'))
                         
-                        if formats_with_audio:
-                            # Выбираем формат с наименьшим размером файла среди форматов с аудио
-                            best_format = min(formats_with_audio, 
+                        height_label = f"{closest_height}p"
+                        if height_label not in formats_dict:
+                            formats_dict[height_label] = {
+                                'format_id': best_format['format_id'],
+                                'filesize': best_format['filesize'],
+                                'ext': best_format['ext'],
+                                'height': closest_height
+                            }
+                    else:
+                        # Если нет форматов с аудио, используем video only + bestaudio
+                        # Но это менее предпочтительно, поэтому выбираем наименьший video only
+                        video_only_formats = [f for f in video_formats[closest_height] if not f.get('has_audio', False)]
+                        if video_only_formats:
+                            best_format = min(video_only_formats, 
                                             key=lambda x: x['filesize'] if x['filesize'] else float('inf'))
                             
                             height_label = f"{closest_height}p"
                             if height_label not in formats_dict:
+                                # Сохраняем format_id, но при скачивании добавим аудио
                                 formats_dict[height_label] = {
                                     'format_id': best_format['format_id'],
                                     'filesize': best_format['filesize'],
                                     'ext': best_format['ext'],
-                                    'height': closest_height
+                                    'height': closest_height,
+                                    'needs_audio': True  # Флаг, что нужно добавить аудио
                                 }
-                        else:
-                            # Если нет форматов с аудио, используем video only + bestaudio
-                            # Но это менее предпочтительно, поэтому выбираем наименьший video only
-                            video_only_formats = [f for f in video_formats[closest_height] if not f.get('has_audio', False)]
-                            if video_only_formats:
-                                best_format = min(video_only_formats, 
-                                                key=lambda x: x['filesize'] if x['filesize'] else float('inf'))
-                                
-                                height_label = f"{closest_height}p"
-                                if height_label not in formats_dict:
-                                    # Сохраняем format_id, но при скачивании добавим аудио
-                                    formats_dict[height_label] = {
-                                        'format_id': best_format['format_id'],
-                                        'filesize': best_format['filesize'],
-                                        'ext': best_format['ext'],
-                                        'height': closest_height,
-                                        'needs_audio': True  # Флаг, что нужно добавить аудио
-                                    }
+            
+            # Выбираем лучший аудио формат (лучшее качество, не наименьший размер)
+            # Сортируем по размеру файла в обратном порядке (больше = лучше качество)
+            if audio_formats:
+                # Фильтруем только качественные аудио форматы (medium, high)
+                # Исключаем low качество (49k, 53k)
+                quality_audio = [f for f in audio_formats if f.get('filesize', 0) > 1000000]  # > 1MB обычно medium+
                 
-                # Выбираем лучший аудио формат (лучшее качество, не наименьший размер)
-                # Сортируем по размеру файла в обратном порядке (больше = лучше качество)
-                if audio_formats:
-                    # Фильтруем только качественные аудио форматы (medium, high)
-                    # Исключаем low качество (49k, 53k)
-                    quality_audio = [f for f in audio_formats if f.get('filesize', 0) > 1000000]  # > 1MB обычно medium+
-                    
-                    if quality_audio:
-                        # Выбираем лучшее качество (наибольший размер = лучшее качество)
-                        best_audio = max(quality_audio, 
-                                        key=lambda x: x['filesize'] if x['filesize'] else 0)
-                    else:
-                        # Если нет качественных, берем лучшее из доступных
-                        best_audio = max(audio_formats, 
-                                        key=lambda x: x['filesize'] if x['filesize'] else 0)
-                    
-                    formats_dict['audio'] = {
-                        'format_id': best_audio['format_id'],
-                        'filesize': best_audio['filesize'],
-                        'ext': best_audio['ext']
-                    }
+                if quality_audio:
+                    # Выбираем лучшее качество (наибольший размер = лучшее качество)
+                    best_audio = max(quality_audio, 
+                                    key=lambda x: x['filesize'] if x['filesize'] else 0)
+                else:
+                    # Если нет качественных, берем лучшее из доступных
+                    best_audio = max(audio_formats, 
+                                    key=lambda x: x['filesize'] if x['filesize'] else 0)
                 
-                logger.info(f"Доступные форматы для {url}: {list(formats_dict.keys())}")
-                return formats_dict if formats_dict else None
+                formats_dict['audio'] = {
+                    'format_id': best_audio['format_id'],
+                    'filesize': best_audio['filesize'],
+                    'ext': best_audio['ext']
+                }
+            
+            logger.info(f"Доступные форматы для {url}: {list(formats_dict.keys())}")
+            return formats_dict if formats_dict else None
                 
         except Exception as e:
             logger.error(f"Ошибка при получении форматов для {url}: {e}", exc_info=True)

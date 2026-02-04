@@ -133,13 +133,23 @@ async def process_download_task(task: dict) -> Optional[int]:
         logger.info(f"[worker] DownloadPlan создан: platform={download_plan.platform}, streamable={download_plan.streamable}")
         
         # 3. Исполняем DownloadPlan через YtDlpService
-        # ВАЖНО: Всегда скачиваем напрямую в память (download_to_stream), не на диск
-        logger.info(f"[worker] Исполняю DownloadPlan через YtDlpService (прямое скачивание в память)")
+        # Стратегия:
+        # - Для маленьких файлов (<50MB): скачиваем в память (download_to_stream) - быстрее
+        # - Для больших файлов: используем pipelined метод (download_to_file_pipelined) - оптимизированный subprocess
+        # - Fallback: обычный download_to_file через yt-dlp Python API
+        logger.info(f"[worker] Исполняю DownloadPlan через YtDlpService")
+        
+        # Пробуем сначала потоковое скачивание в память (для маленьких файлов)
         result = ytdlp_service.download_to_stream(download_plan)
         
-        # Если потоковое скачивание не сработало, пробуем через файл (fallback)
+        # Если потоковое скачивание не сработало, пробуем pipelined метод (быстрее для больших файлов)
         if not result:
-            logger.warning(f"[worker] Потоковое скачивание не удалось, пробую через файл (fallback)")
+            logger.info(f"[worker] Потоковое скачивание не удалось, пробую pipelined метод (оптимизированный subprocess)")
+            result = await ytdlp_service.download_to_file_pipelined(download_plan)
+        
+        # Если pipelined не сработал, пробуем обычный метод через yt-dlp Python API (fallback)
+        if not result:
+            logger.warning(f"[worker] Pipelined метод не удался, пробую через yt-dlp Python API (fallback)")
             result = ytdlp_service.download_to_file(download_plan)
         
         if not result:
@@ -157,30 +167,77 @@ async def process_download_task(task: dict) -> Optional[int]:
         file_size_mb = file_size / (1024 * 1024)
         logger.info(f"[worker] Размер файла: {file_size_mb:.2f} MB")
         
+        # Определяем, это аудио или видео
+        # Проверяем по download_plan.audio_only и по расширению файла
+        audio_extensions = {'.m4a', '.webm', '.opus', '.mp3', '.ogg', '.flac', '.wav', '.m4b'}
+        
+        # Получаем расширение из filename или из пути к файлу
+        if isinstance(video_data, str):
+            # Если это путь к файлу, берем расширение из пути
+            file_ext = os.path.splitext(video_data)[1].lower()
+        else:
+            # Если это BytesIO, берем расширение из filename
+            file_ext = os.path.splitext(filename)[1].lower()
+        
+        is_audio = download_plan.audio_only or file_ext in audio_extensions
+        
+        if is_audio:
+            logger.info(f"[worker] Определен тип: audio (расширение: {file_ext}, audio_only: {download_plan.audio_only})")
+        else:
+            logger.info(f"[worker] Определен тип: video (расширение: {file_ext})")
+        
         # 4. Загружаем в Telegram канал
+        # Для audio-only файлов используем send_audio, для видео - send_video
         # Для маленьких файлов (<50MB) - используем BufferedInputFile (из памяти)
         # Для больших файлов - используем FSInputFile (временный файл)
+        # 
+        # ПРИМЕЧАНИЕ: Настоящее streaming (переливание без полного скачивания) невозможно из-за ограничений:
+        # - Telegram Bot API требует полный файл для multipart/form-data upload
+        # - aiogram не поддерживает streaming upload из процесса напрямую
+        # - Нужно знать размер файла заранее для chunked upload
+        # 
+        # Текущая оптимизация: используем pipelined метод для больших файлов, который использует
+        # subprocess напрямую и может быть быстрее, чем yt-dlp Python API
         try:
             if isinstance(video_data, io.BytesIO):
                 # Маленький файл в памяти - используем BufferedInputFile
-                logger.info(f"[worker] Загрузка в канал из памяти: {file_size_mb:.2f} MB")
+                logger.info(f"[worker] Загрузка в канал из памяти: {file_size_mb:.2f} MB (тип: {'audio' if is_audio else 'video'})")
                 video_data.seek(0)  # Возвращаемся в начало потока
-                message = await bot.send_video(
-                    chat_id=CHANNEL_ID,
-                    video=types.BufferedInputFile(
-                        file=video_data.read(),
-                        filename=filename
-                    ),
-                    caption=f"Source: {url}"
-                )
+                
+                if is_audio:
+                    message = await bot.send_audio(
+                        chat_id=CHANNEL_ID,
+                        audio=types.BufferedInputFile(
+                            file=video_data.read(),
+                            filename=filename
+                        ),
+                        caption=f"Source: {url}"
+                    )
+                else:
+                    message = await bot.send_video(
+                        chat_id=CHANNEL_ID,
+                        video=types.BufferedInputFile(
+                            file=video_data.read(),
+                            filename=filename
+                        ),
+                        caption=f"Source: {url}"
+                    )
             else:
                 # Большой файл - используем FSInputFile (временный файл)
-                logger.info(f"[worker] Загрузка в канал из файла: {video_data} ({file_size_mb:.2f} MB)")
-                message = await bot.send_video(
-                    chat_id=CHANNEL_ID,
-                    video=types.FSInputFile(video_data),
-                    caption=f"Source: {url}"
-                )
+                logger.info(f"[worker] Загрузка в канал из файла: {video_data} ({file_size_mb:.2f} MB, тип: {'audio' if is_audio else 'video'})")
+                
+                if is_audio:
+                    message = await bot.send_audio(
+                        chat_id=CHANNEL_ID,
+                        audio=types.FSInputFile(video_data),
+                        caption=f"Source: {url}"
+                    )
+                else:
+                    message = await bot.send_video(
+                        chat_id=CHANNEL_ID,
+                        video=types.FSInputFile(video_data),
+                        caption=f"Source: {url}"
+                    )
             
             message_id = message.message_id
         finally:
@@ -195,9 +252,11 @@ async def process_download_task(task: dict) -> Optional[int]:
                 except Exception as e:
                     logger.warning(f"[worker] Не удалось удалить временный файл {video_data}: {e}")
         
-        # 5. Получаем file_id из видео
+        # 5. Получаем file_id из сообщения (видео или аудио)
         file_id = None
-        if message.video:
+        if message.audio:
+            file_id = message.audio.file_id
+        elif message.video:
             file_id = message.video.file_id
         elif message.document:
             file_id = message.document.file_id

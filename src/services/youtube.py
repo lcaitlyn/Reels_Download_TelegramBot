@@ -60,6 +60,9 @@ class YouTubeService(BaseService):
         """
         Построить план скачивания для YouTube
         
+        ОПТИМИЗАЦИЯ: Не получаем метаданные здесь - это блокирует event loop.
+        Метаданные будут получены во время скачивания через yt-dlp.
+        
         Args:
             url: URL видео YouTube
             quality: Качество видео (480p, 720p, 1080p, audio) или None
@@ -68,29 +71,22 @@ class YouTubeService(BaseService):
         Returns:
             DownloadPlan или None при ошибке
         """
-        # Получаем метаданные
-        metadata = self.get_metadata(url)
-        if not metadata:
-            logger.error("[YouTube] Не удалось получить метаданные")
-            return None
-        
-        video_id = metadata.get('id')
+        # Извлекаем video_id из URL (быстро, без запросов к API)
+        video_id = self.extract_video_id(url)
         if not video_id:
-            logger.error("[YouTube] Не удалось получить video_id из метаданных")
+            logger.error("[YouTube] Не удалось извлечь video_id из URL")
             return None
         
         # Определяем формат
         format_selector = self._prepare_format_selector(format_id, quality)
         
-        # Определяем размер файла
-        filesize = metadata.get('filesize') or metadata.get('filesize_approx', 0)
-        filesize_mb = filesize / (1024 * 1024) if filesize else 0
-        
         # Формируем опции yt-dlp для YouTube
         ydl_opts = self._get_ydl_opts_for_youtube(format_selector)
         
-        # Определяем, можно ли стримить в память (<50MB)
-        streamable = filesize_mb < 50 if filesize else False
+        # Не знаем размер файла заранее - будем определять во время скачивания
+        # По умолчанию считаем, что можно стримить (для маленьких файлов)
+        # Если файл окажется большим, worker переключится на файловый режим
+        streamable = True  # Будет переопределено во время скачивания
         
         # Определяем, только ли аудио
         audio_only = quality == 'audio' if quality else False
@@ -104,7 +100,7 @@ class YouTubeService(BaseService):
             audio_only=audio_only,
             streamable=streamable,
             ydl_opts=ydl_opts,
-            metadata=metadata
+            metadata=None  # Метаданные будут получены во время скачивания
         )
     
     def _prepare_format_selector(
@@ -116,7 +112,7 @@ class YouTubeService(BaseService):
         Подготовить селектор формата для YouTube
         
         Args:
-            format_id: ID формата (может быть video only, тогда добавляем аудио)
+            format_id: ID формата (может быть video only, audio only, или комбинированный)
             quality: Качество видео (480p, 720p, 1080p, audio)
             
         Returns:
@@ -124,21 +120,33 @@ class YouTubeService(BaseService):
         """
         # Если указан format_id, используем его
         if format_id:
+            # Проверяем, является ли format_id форматом "audio only"
+            # Audio-only форматы: 140 (m4a), 250 (opus/webm), 251 (opus/webm), 139 (m4a), и т.д.
+            audio_only_formats = ('140', '250', '251', '139', '141', '171', '249')
+            if format_id.startswith(audio_only_formats) or format_id in audio_only_formats:
+                # Это audio-only формат - используем как есть, без добавления видео
+                logger.info(f"[YouTube] Использую audio-only формат {format_id} как есть")
+                return format_id
+            
             # Проверяем, является ли format_id форматом "video only"
-            try:
-                if format_id.isdigit() or format_id.startswith(('135', '136', '137', '160', '133', '134')):
-                    # Это video only формат, добавляем аудио
-                    format_selector = f"{format_id}+bestaudio/best"
-                    logger.info(f"[YouTube] Добавляю аудио дорожку к формату {format_id}: {format_selector}")
-                    return format_selector
-            except:
-                pass
+            # Video-only форматы: 135, 136, 137, 160, 133, 134, 298, 299, и т.д.
+            video_only_formats = ('135', '136', '137', '160', '133', '134', '298', '299', '264', '266', '138')
+            if format_id.startswith(video_only_formats) or format_id in video_only_formats:
+                # Это video only формат, добавляем аудио
+                format_selector = f"{format_id}+bestaudio/best"
+                logger.info(f"[YouTube] Добавляю аудио дорожку к video-only формату {format_id}: {format_selector}")
+                return format_selector
+            
+            # Если формат не определен, используем как есть (может быть комбинированный формат)
             return format_id
         
         # Если указано качество, используем его
         if quality:
             if quality == 'audio':
-                return 'bestaudio/best'
+                # Строгий селектор для audio-only: только аудио форматы, без видео
+                # Используем bestaudio с fallback на конкретные audio-only форматы
+                # ВАЖНО: не используем /best в конце, чтобы не скачать видео
+                return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/140/250/251'
             elif quality == '480p':
                 return 'best[height<=480][ext=mp4]/best[height<=480]'
             elif quality == '720p':

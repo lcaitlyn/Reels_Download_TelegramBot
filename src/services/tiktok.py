@@ -55,6 +55,9 @@ class TikTokService(BaseService):
         """
         Построить план скачивания для TikTok
         
+        ОПТИМИЗАЦИЯ: Не получаем метаданные здесь - это блокирует event loop.
+        Метаданные будут получены во время скачивания через yt-dlp.
+        
         Args:
             url: URL видео TikTok
             quality: Качество (для TikTok не используется)
@@ -63,27 +66,20 @@ class TikTokService(BaseService):
         Returns:
             DownloadPlan или None при ошибке
         """
-        # Получаем метаданные
-        metadata = self.get_metadata(url)
-        if not metadata:
-            logger.error("[TikTok] Не удалось получить метаданные")
-            return None
-        
-        video_id = metadata.get('id')
+        # Извлекаем video_id из URL (быстро, без запросов к API)
+        video_id = self.extract_video_id(url)
         if not video_id:
-            logger.error("[TikTok] Не удалось получить video_id из метаданных")
+            logger.error("[TikTok] Не удалось извлечь video_id из URL")
             return None
-        
-        # Определяем размер файла
-        filesize = metadata.get('filesize') or metadata.get('filesize_approx', 0)
-        filesize_mb = filesize / (1024 * 1024) if filesize else 0
         
         # Формируем опции yt-dlp для TikTok
         format_selector = format_id if format_id else 'worst[ext=mp4]/worst[ext=webm]/worst'
         ydl_opts = self._get_ydl_opts_for_tiktok(format_selector)
         
-        # Определяем, можно ли стримить в память (<50MB)
-        streamable = filesize_mb < 50 if filesize else False
+        # Не знаем размер файла заранее - будем определять во время скачивания
+        # По умолчанию считаем, что можно стримить (для маленьких файлов)
+        # Если файл окажется большим, worker переключится на файловый режим
+        streamable = True  # Будет переопределено во время скачивания
         
         return DownloadPlan(
             platform='tiktok',
@@ -92,7 +88,7 @@ class TikTokService(BaseService):
             format_selector=format_selector,
             streamable=streamable,
             ydl_opts=ydl_opts,
-            metadata=metadata
+            metadata=None  # Метаданные будут получены во время скачивания
         )
     
     def _get_ydl_opts_for_tiktok(self, format_selector: str) -> Dict[str, Any]:

@@ -57,6 +57,9 @@ class InstagramService(BaseService):
         """
         Построить план скачивания для Instagram
         
+        ОПТИМИЗАЦИЯ: Не получаем метаданные здесь - это блокирует event loop.
+        Метаданные будут получены во время скачивания через yt-dlp.
+        
         Args:
             url: URL видео Instagram
             quality: Качество (для Instagram не используется)
@@ -65,35 +68,20 @@ class InstagramService(BaseService):
         Returns:
             DownloadPlan или None при ошибке
         """
-        # Получаем метаданные
-        metadata = self.get_metadata(url)
-        if not metadata:
-            logger.error("[Instagram] Не удалось получить метаданные")
-            return None
-        
-        video_id = metadata.get('id')
+        # Извлекаем video_id из URL (быстро, без запросов к API)
+        video_id = self.extract_video_id(url)
         if not video_id:
-            logger.error("[Instagram] Не удалось получить video_id из метаданных")
+            logger.error("[Instagram] Не удалось извлечь video_id из URL")
             return None
-        
-        # Проверяем доступность видео
-        if not metadata.get('url'):
-            logger.error("[Instagram] ❌ Видео недоступно. Возможные причины:")
-            logger.error("  - Видео приватное или требует авторизацию")
-            logger.error("  - Видео удалено или недоступно")
-            logger.error("  - Instagram заблокировал доступ")
-            return None
-        
-        # Определяем размер файла
-        filesize = metadata.get('filesize') or metadata.get('filesize_approx', 0)
-        filesize_mb = filesize / (1024 * 1024) if filesize else 0
         
         # Формируем опции yt-dlp для Instagram
         format_selector = 'best[ext=mp4]/best'
         ydl_opts = self._get_ydl_opts_for_instagram(format_selector)
         
-        # Определяем, можно ли стримить в память (<50MB)
-        streamable = filesize_mb < 50 if filesize else False
+        # Не знаем размер файла заранее - будем определять во время скачивания
+        # По умолчанию считаем, что можно стримить (для маленьких файлов)
+        # Если файл окажется большим, worker переключится на файловый режим
+        streamable = True  # Будет переопределено во время скачивания
         
         return DownloadPlan(
             platform='instagram',
@@ -102,7 +90,7 @@ class InstagramService(BaseService):
             format_selector=format_selector,
             streamable=streamable,
             ydl_opts=ydl_opts,
-            metadata=metadata
+            metadata=None  # Метаданные будут получены во время скачивания
         )
     
     def _get_info_opts_for_instagram(self) -> Dict[str, Any]:

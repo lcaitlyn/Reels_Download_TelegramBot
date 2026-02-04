@@ -1,0 +1,85 @@
+services:
+  # Redis для кэширования и очередей (внутри compose‑сети, без проброса порта наружу)
+  redis:
+    image: redis:7-alpine
+    container_name: downloader_bot_redis
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Основной Telegram‑бот
+  bot:
+    build: .
+    container_name: downloader_bot
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Если не используешь Postgres/аналитику на сервере, эти переменные можно не задавать
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    command: ["python", "main.py"]
+
+  # Worker для скачивания видео (1)
+  worker1:
+    build: .
+    container_name: downloader_bot_worker1
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.download_worker"]
+
+  # Worker для скачивания видео (2) — можно удалить или скейлить через --scale
+  worker2:
+    build: .
+    container_name: downloader_bot_worker2
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.download_worker"]
+
+volumes:
+  redis_data:
+

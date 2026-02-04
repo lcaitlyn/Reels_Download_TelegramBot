@@ -185,3 +185,35 @@ docker-compose run --rm migrations
 ### Проблемы с дисковым пространством
 - Очистите старые образы: `docker system prune -a`
 - Очистите volumes (осторожно!): `docker volume prune`
+
+## Запуск на сервере (упрощённый prod)
+
+Если на сервере тебе нужен только сам Telegram‑бот + воркеры (без Postgres/analytics/dashboard), можно использовать отдельный compose‑файл:
+
+1. **Создай `.env`** (как и для dev):
+
+   ```bash
+   cp .env.example .env
+   # Заполни BOT_TOKEN и TELEGRAM_CHANNEL_ID
+   ```
+
+2. **Запусти прод‑стенд** (бот + Redis + 2 download‑воркера):
+
+   ```bash
+   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+   ```
+
+3. **Проверь, что всё работает**:
+
+   ```bash
+   docker compose -f docker-compose.prod.yml ps
+   docker compose -f docker-compose.prod.yml logs -f bot
+   ```
+
+4. **Остановка**:
+
+   ```bash
+   docker compose -f docker-compose.prod.yml down
+   ```
+
+На сервере обычно не нужно пробрасывать порты Redis/Postgres наружу — в `docker-compose.prod.yml` Redis доступен только внутри Docker‑сети, а бот и воркеры общаются с ним по имени `redis`.

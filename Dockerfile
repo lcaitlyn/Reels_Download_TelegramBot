@@ -2,6 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Базовые настройки для логов и pip
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     ffmpeg \
