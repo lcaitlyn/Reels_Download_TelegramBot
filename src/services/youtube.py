@@ -31,6 +31,11 @@ class YouTubeService(BaseService):
         """Может ли сервис обработать этот URL"""
         return 'youtube.com' in url.lower() or 'youtu.be' in url.lower()
     
+    @staticmethod
+    def _is_shorts_url(url: str) -> bool:
+        """Shorts: вертикальное видео 9:16 (720x1280, 1080x1920)."""
+        return 'shorts' in url.lower()
+    
     def extract_video_id(self, url: str) -> Optional[str]:
         """Извлечь канонический ID видео YouTube"""
         return self.downloader.get_video_id(url)
@@ -77,16 +82,15 @@ class YouTubeService(BaseService):
             logger.error("[YouTube] Не удалось извлечь video_id из URL")
             return None
         
-        # Определяем формат
-        format_selector = self._prepare_format_selector(format_id, quality)
+        # Определяем формат (для Shorts — вертикальное 9:16: 720x1280 → 480x854 → 360, без выбора качества)
+        is_shorts = self._is_shorts_url(url) or quality == 'shorts'
+        format_selector = self._prepare_format_selector(format_id, quality, is_shorts=is_shorts)
         
         # Формируем опции yt-dlp для YouTube
         ydl_opts = self._get_ydl_opts_for_youtube(format_selector)
         
-        # Не знаем размер файла заранее - будем определять во время скачивания
-        # По умолчанию считаем, что можно стримить (для маленьких файлов)
-        # Если файл окажется большим, worker переключится на файловый режим
-        streamable = True  # Будет переопределено во время скачивания
+        # Shorts часто идут как HLS (m3u8) — в stdout дают 0 байт, стрим не годится. Качаем только в файл.
+        streamable = not is_shorts
         
         # Определяем, только ли аудио
         audio_only = quality == 'audio' if quality else False
@@ -106,56 +110,45 @@ class YouTubeService(BaseService):
     def _prepare_format_selector(
         self,
         format_id: Optional[str],
-        quality: Optional[str]
+        quality: Optional[str],
+        *,
+        is_shorts: bool = False
     ) -> str:
         """
-        Подготовить селектор формата для YouTube
-        
-        Args:
-            format_id: ID формата (может быть video only, audio only, или комбинированный)
-            quality: Качество видео (480p, 720p, 1080p, audio)
-            
-        Returns:
-            Селектор формата для yt-dlp
+        Подготовить селектор формата для YouTube.
+        Shorts (9:16): один уже сведённый формат (без мержа), чтобы качать без ffmpeg.
+        Приоритет: 720x1280 → 480x854 → 360 (один поток mp4/m3u8 с видео+звуком).
         """
-        # Если указан format_id, используем его
+        # Shorts: один формат (без bestvideo+bestaudio), без ffmpeg. Лучший готовый поток до 1280.
+        if is_shorts:
+            if quality == '1080p':
+                return 'best[height<=1920][ext=mp4]/best[height<=1920]'
+            return 'best[height<=1280][ext=mp4]/best[height<=1280]/best[height<=854]/best'
+        
+        # Обычное видео (16:9): при выборе 480p/720p/1080p ВСЕГДА селектор по качеству, НЕ format_id.
+        # (92, 93, 94, 300 и т.д. — HLS, при -f 300 дают "The downloaded file is empty".)
+        if quality in ('480p', '720p', '1080p'):
+            if quality == '480p':
+                return 'bestvideo[height<=480][ext=mp4]+bestaudio/best'
+            if quality == '720p':
+                return 'bestvideo[height<=720][ext=mp4]+bestaudio/best'
+            if quality == '1080p':
+                return 'bestvideo[height<=1080][ext=mp4]+bestaudio/best'
+        
         if format_id:
-            # Проверяем, является ли format_id форматом "audio only"
-            # Audio-only форматы: 140 (m4a), 250 (opus/webm), 251 (opus/webm), 139 (m4a), и т.д.
             audio_only_formats = ('140', '250', '251', '139', '141', '171', '249')
             if format_id.startswith(audio_only_formats) or format_id in audio_only_formats:
-                # Это audio-only формат - используем как есть, без добавления видео
                 logger.info(f"[YouTube] Использую audio-only формат {format_id} как есть")
                 return format_id
-            
-            # Проверяем, является ли format_id форматом "video only"
-            # Video-only форматы: 135, 136, 137, 160, 133, 134, 298, 299, и т.д.
-            video_only_formats = ('135', '136', '137', '160', '133', '134', '298', '299', '264', '266', '138')
+            video_only_formats = ('135', '136', '137', '160', '133', '134', '298', '299', '264', '266', '138', '779', '780')
             if format_id.startswith(video_only_formats) or format_id in video_only_formats:
-                # Это video only формат, добавляем аудио
-                format_selector = f"{format_id}+bestaudio/best"
-                logger.info(f"[YouTube] Добавляю аудио дорожку к video-only формату {format_id}: {format_selector}")
-                return format_selector
-            
-            # Если формат не определен, используем как есть (может быть комбинированный формат)
+                return f"{format_id}+bestaudio/best"
             return format_id
         
-        # Если указано качество, используем его
-        if quality:
-            if quality == 'audio':
-                # Строгий селектор для audio-only: только аудио форматы, без видео
-                # Используем bestaudio с fallback на конкретные audio-only форматы
-                # ВАЖНО: не используем /best в конце, чтобы не скачать видео
-                return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/140/250/251'
-            elif quality == '480p':
-                return 'best[height<=480][ext=mp4]/best[height<=480]'
-            elif quality == '720p':
-                return 'best[height<=720][ext=mp4]/best[height<=720]'
-            elif quality == '1080p':
-                return 'best[height<=1080][ext=mp4]/best[height<=1080]'
+        if quality == 'audio':
+            return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/140/250/251'
         
-        # По умолчанию для Shorts - низкое качество
-        return 'best[height<=360][ext=mp4]/best[height<=240][ext=mp4]/best[height<=144][ext=mp4]/best[ext=mp4]/best'
+        return 'bestvideo[height<=360][ext=mp4]+bestaudio/best'
     
     def _get_ydl_opts_for_youtube(self, format_selector: str) -> Dict[str, Any]:
         """
@@ -187,5 +180,5 @@ class YouTubeService(BaseService):
         return self.extract_video_id(url)
     
     def get_default_format(self) -> str:
-        """Формат по умолчанию для YouTube (для Shorts)"""
-        return 'best[height<=360][ext=mp4]/best[height<=240][ext=mp4]/best[height<=144][ext=mp4]/best[ext=mp4]/best'
+        """Формат по умолчанию для YouTube (для Shorts) — видео со звуком"""
+        return 'bestvideo[height<=360][ext=mp4]+bestaudio/best'

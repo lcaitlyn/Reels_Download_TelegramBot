@@ -23,7 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from src.database.redis_db import Database
 from src.downloader.downloader import VideoDownloader
 from src.downloader.download_manager import DownloadManager
-from src.utils.utils import normalize_url, is_supported_url, is_youtube_video, get_video_id_fast, get_platform
+from src.utils.utils import normalize_url, is_supported_url, is_youtube_video, is_youtube_shorts, get_video_id_fast, get_platform
 from src.services import LinkProcessingService
 from src.services.service_factory import ServiceFactory
 from src.models.download_response import DownloadResponse
@@ -458,6 +458,7 @@ async def start_handler(message: types.Message):
                 f"Или используй {BOT_USERNAME} в любом чате для быстрого доступа!"
             )
         elif result['type'] == 'deep_link':
+            quality = 'shorts' if result.get('is_shorts') else None
             # Проверяем кэш
             if result.get('cached_message_id'):
                 success = await send_video(message.chat.id, result['cached_message_id'])
@@ -469,7 +470,8 @@ async def start_handler(message: types.Message):
                         message.chat.id,
                         status_msg,
                         user_id,
-                        'deep_link'
+                        'deep_link',
+                        quality=quality
                     )
             else:
                 # Видео нет в кэше - скачиваем
@@ -479,7 +481,8 @@ async def start_handler(message: types.Message):
                     message.chat.id,
                     status_msg,
                     user_id,
-                    'deep_link'
+                    'deep_link',
+                    quality=quality
                 )
         elif result['type'] == 'error':
             if result.get('error') == 'unsupported_platform':
@@ -514,22 +517,37 @@ async def message_handler(message: types.Message):
         await send_error(message.chat.id, 'unsupported_platform')
         return
     
-    # Для YouTube видео (не Shorts) - показываем выбор качества
+    # YouTube Shorts: сразу качаем в вертикальном формате (720→480→360), без выбора качества
+    if is_youtube_shorts(text):
+        if is_inline_query_result:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        status_msg = await send_wait_message(message.chat.id)
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        source = 'inline' if is_inline_query_result else 'message'
+        await process_video_download(
+            normalized_url, message.chat.id, status_msg, user_id, source,
+            quality='shorts'
+        )
+        return
+
+    # Обычное YouTube видео (не Shorts) — показываем выбор качества
     if is_youtube_video(normalized_url):
         video_id, _ = get_video_id_fast(normalized_url)
         if not video_id:
             video_id = downloader.get_video_id(normalized_url)
         if not video_id:
             video_id = normalized_url
-        
-        # Показываем выбор качества
+
         quality_selected = await handle_youtube_quality_selection(
             message, normalized_url, video_id, is_inline_query_result
         )
         if quality_selected:
             return
-    
-    # Обычная обработка для не-YouTube видео
+
+    # Обычная обработка для не-YouTube видео (Instagram, TikTok и т.д.)
     # Удаляем сообщение со ссылкой (если это inline-результат)
     if is_inline_query_result:
         try:

@@ -77,6 +77,20 @@ def is_supported_url(url: str) -> bool:
     return any(platform in url_lower for platform in platforms)
 
 
+def is_youtube_shorts(url: str) -> bool:
+    """
+    Проверка, является ли URL ссылкой на YouTube Shorts.
+    Вызывать до normalize_url(), т.к. после нормализации Shorts превращается в watch?v=.
+    
+    Args:
+        url: URL для проверки (оригинальная строка пользователя)
+        
+    Returns:
+        True если в URL есть youtube/shorts/ (вертикальное короткое видео)
+    """
+    return 'shorts' in url.lower() and ('youtube.com' in url.lower() or 'youtu.be' in url.lower())
+
+
 def is_youtube_video(url: str) -> bool:
     """
     Проверка, является ли URL YouTube видео (не Shorts)

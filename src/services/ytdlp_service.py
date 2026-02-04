@@ -88,7 +88,13 @@ class YtDlpService:
             Tuple (BytesIO, размер в байтах, имя файла) или None при ошибке
         """
         url = download_plan.url
-        format_selector = download_plan.format_selector
+        format_selector = download_plan.format_selector or ''
+        
+        # Для форматов с мержем (bestvideo+bestaudio) вывод в stdout ненадёжен — yt-dlp не мержит в pipe.
+        # Итог: видео без звука. Пропускаем stream, worker использует download_to_file/pipelined (мерж в файл).
+        if '+' in format_selector:
+            logger.info(f"[YtDlpService] Формат с мержем (video+audio), пропускаю stream: {format_selector[:50]}...")
+            return None
         
         logger.info(f"[YtDlpService] Скачиваю в поток: {url} (формат: {format_selector})")
         
@@ -300,8 +306,60 @@ class YtDlpService:
             error_msg = str(e)
             logger.error(f"[YtDlpService] ❌ yt-dlp DownloadError при скачивании {url}: {error_msg}")
             
+            # YouTube Shorts: один готовый поток без мержа (без ffmpeg)
+            if download_plan.platform == 'youtube' and getattr(download_plan, 'quality', None) == 'shorts':
+                logger.warning(f"[YtDlpService] Пробую альтернативные форматы для YouTube Shorts")
+                alt_formats = ['best[height<=1280][ext=mp4]/best[height<=1280]/best', 'best[ext=mp4]/best', 'best']
+                for alt_format in alt_formats:
+                    logger.info(f"[YtDlpService] Пробую формат: {alt_format}")
+                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
+                        candidate_path = f"{tmp_path}.{ext}"
+                        if os.path.exists(candidate_path):
+                            try:
+                                os.remove(candidate_path)
+                            except Exception:
+                                pass
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    ydl_opts['format'] = alt_format
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([url])
+                        actual_file_path = None
+                        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
+                            candidate_path = f"{tmp_path}.{ext}"
+                            if os.path.exists(candidate_path):
+                                actual_file_path = candidate_path
+                                break
+                        if not actual_file_path and os.path.exists(tmp_path):
+                            actual_file_path = tmp_path
+                        file_size = os.path.getsize(actual_file_path) if actual_file_path and os.path.exists(actual_file_path) else 0
+                        if file_size > 0:
+                            logger.info(f"[YtDlpService] ✅ Shorts скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
+                            tmp_path = actual_file_path
+                            break
+                    except Exception as alt_e:
+                        logger.warning(f"[YtDlpService] Ошибка с форматом {alt_format}: {alt_e}")
+                        continue
+                else:
+                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
+                        candidate_path = f"{tmp_path}.{ext}"
+                        if os.path.exists(candidate_path):
+                            try:
+                                os.remove(candidate_path)
+                            except Exception:
+                                pass
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    return None
             # Для Instagram пробуем альтернативные форматы
-            if download_plan.platform == 'instagram':
+            elif download_plan.platform == 'instagram':
                 logger.warning(f"[YtDlpService] Пробую альтернативные форматы для Instagram")
                 alt_formats = ['best', 'worst', 'best[ext=mp4]', 'worst[ext=mp4]', 'bestvideo+bestaudio/best']
                 
@@ -415,13 +473,46 @@ class YtDlpService:
         # Проверяем размер файла
         file_size = os.path.getsize(actual_file_path) if os.path.exists(actual_file_path) else 0
         
-        if file_size == 0:
-            logger.error("[YtDlpService] Скачанный файл пустой")
+        if file_size == 0 and download_plan.platform == 'youtube' and getattr(download_plan, 'quality', None) == 'shorts':
             try:
                 if actual_file_path != tmp_path:
                     os.remove(actual_file_path)
-                os.remove(tmp_path)
-            except:
+            except Exception:
+                pass
+            logger.warning("[YtDlpService] Shorts: файл пустой, пробую альтернативные форматы")
+            for alt_format in ['best[ext=mp4]/best', 'best']:
+                ydl_opts['format'] = alt_format
+                for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
+                    p = f"{tmp_path}.{ext}"
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+                except Exception:
+                    continue
+                for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
+                    candidate_path = f"{tmp_path}.{ext}"
+                    if os.path.exists(candidate_path):
+                        sz = os.path.getsize(candidate_path)
+                        if sz > 0:
+                            actual_file_path = candidate_path
+                            file_size = sz
+                            logger.info(f"[YtDlpService] ✅ Shorts скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
+                            break
+                if file_size > 0:
+                    break
+        if file_size == 0:
+            logger.error("[YtDlpService] Скачанный файл пустой")
+            try:
+                if actual_file_path != tmp_path and os.path.exists(actual_file_path):
+                    os.remove(actual_file_path)
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
                 pass
             return None
         

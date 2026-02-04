@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 from urllib.parse import unquote
 from src.database.redis_db import Database
-from src.utils.utils import normalize_url, is_supported_url, get_video_id_fast
+from src.utils.utils import normalize_url, is_supported_url, is_youtube_shorts, get_video_id_fast
 from src.events.events import VideoViewClickedEvent
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,8 @@ class HandleStartUseCase:
             
             # Проверяем кэш
             cached_message_id = await self.db.get_cached_message_id(video_id=video_id, url=url)
-            
+            is_shorts = is_youtube_shorts(param)
+
             if cached_message_id:
                 # Публикуем событие VideoViewClickedEvent для deep link
                 try:
@@ -142,14 +143,15 @@ class HandleStartUseCase:
                     await self.db.add_analytics_event(event.to_json())
                 except Exception as e:
                     logger.error(f"Ошибка при публикации события VideoViewClickedEvent: {e}")
-                
+
                 return {
                     'type': 'deep_link',
                     'url': url,
                     'video_id': video_id,
-                    'cached_message_id': cached_message_id
+                    'cached_message_id': cached_message_id,
+                    'is_shorts': is_shorts
                 }
-            
+
             # Публикуем событие VideoViewClickedEvent для deep link
             try:
                 event = VideoViewClickedEvent(
@@ -160,10 +162,11 @@ class HandleStartUseCase:
                 await self.db.add_analytics_event(event.to_json())
             except Exception as e:
                 logger.error(f"Ошибка при публикации события VideoViewClickedEvent: {e}")
-            
+
             return {
                 'type': 'deep_link',
                 'url': url,
                 'video_id': video_id,
-                'cached_message_id': None
+                'cached_message_id': None,
+                'is_shorts': is_shorts
             }

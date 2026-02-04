@@ -188,61 +188,58 @@ class VideoDownloader:
                         'has_audio': acodec != 'none'  # Есть ли аудио в этом формате
                     })
             
-            # Выбираем лучшие форматы для каждого разрешения
-            # ВАЖНО: выбираем только форматы с видео+аудио (не video only)
-            target_heights = [480, 720, 1080]
-            for target_height in target_heights:
-                # Ищем ближайшее разрешение
-                closest_height = None
-                min_diff = float('inf')
+            # Shorts (9:16): только 720p (height 1280), 1080p (height 1920).
+            # Обычное видео: 480p = height 480 (16:9) или 854 (9:16 480x854), 720p = 720 или 1280, 1080p = 1080 или 1920.
+            is_shorts = 'shorts' in url.lower()
+            if is_shorts:
+                target_heights_with_labels = [(1280, '720p'), (1920, '1080p')]
+            else:
+                # Для каждого качества — допустимые heights: горизонталь и вертикаль (чтобы 94=480x854 попадал в 480p)
+                target_heights_with_labels = [
+                    ([480, 854], '480p'),   # 480 (16:9) или 854 (9:16 480x854)
+                    ([720, 1280], '720p'),
+                    ([1080, 1920], '1080p'),
+                ]
+            
+            for item, height_label in target_heights_with_labels:
+                heights_to_use = [item] if isinstance(item, int) else list(item)
                 
-                for height in video_formats.keys():
-                    if height and height <= target_height:
-                        diff = target_height - height
-                        if diff < min_diff:
-                            min_diff = diff
-                            closest_height = height
+                # Собираем все форматы с допустимыми heights (приоритет: с аудио, меньший размер)
+                candidates = []
+                for h in heights_to_use:
+                    if h in video_formats:
+                        candidates.extend(video_formats[h])
                 
-                if closest_height:
-                    # Фильтруем форматы: выбираем только те, которые содержат и видео, и аудио
-                    # Приоритет: форматы с аудио > video only
-                    formats_with_audio = [f for f in video_formats[closest_height] if f.get('has_audio', False)]
-                    
-                    if formats_with_audio:
-                        # Выбираем формат с наименьшим размером файла среди форматов с аудио
-                        best_format = min(formats_with_audio, 
+                if not candidates:
+                    continue
+                
+                formats_with_audio = [f for f in candidates if f.get('has_audio', False)]
+                if formats_with_audio:
+                    best_format = min(formats_with_audio,
+                                    key=lambda x: x['filesize'] if x['filesize'] else float('inf'))
+                    if height_label not in formats_dict:
+                        formats_dict[height_label] = {
+                            'format_id': best_format['format_id'],
+                            'filesize': best_format['filesize'],
+                            'ext': best_format['ext'],
+                            'height': best_format.get('height')
+                        }
+                else:
+                    video_only = [f for f in candidates if not f.get('has_audio', False)]
+                    if video_only:
+                        best_format = min(video_only,
                                         key=lambda x: x['filesize'] if x['filesize'] else float('inf'))
-                        
-                        height_label = f"{closest_height}p"
                         if height_label not in formats_dict:
                             formats_dict[height_label] = {
                                 'format_id': best_format['format_id'],
                                 'filesize': best_format['filesize'],
                                 'ext': best_format['ext'],
-                                'height': closest_height
+                                'height': best_format.get('height'),
+                                'needs_audio': True
                             }
-                    else:
-                        # Если нет форматов с аудио, используем video only + bestaudio
-                        # Но это менее предпочтительно, поэтому выбираем наименьший video only
-                        video_only_formats = [f for f in video_formats[closest_height] if not f.get('has_audio', False)]
-                        if video_only_formats:
-                            best_format = min(video_only_formats, 
-                                            key=lambda x: x['filesize'] if x['filesize'] else float('inf'))
-                            
-                            height_label = f"{closest_height}p"
-                            if height_label not in formats_dict:
-                                # Сохраняем format_id, но при скачивании добавим аудио
-                                formats_dict[height_label] = {
-                                    'format_id': best_format['format_id'],
-                                    'filesize': best_format['filesize'],
-                                    'ext': best_format['ext'],
-                                    'height': closest_height,
-                                    'needs_audio': True  # Флаг, что нужно добавить аудио
-                                }
             
-            # Выбираем лучший аудио формат (лучшее качество, не наименьший размер)
-            # Сортируем по размеру файла в обратном порядке (больше = лучше качество)
-            if audio_formats:
+            # Аудио только для обычного видео (не Shorts)
+            if audio_formats and not is_shorts:
                 # Фильтруем только качественные аудио форматы (medium, high)
                 # Исключаем low качество (49k, 53k)
                 quality_audio = [f for f in audio_formats if f.get('filesize', 0) > 1000000]  # > 1MB обычно medium+

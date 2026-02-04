@@ -139,17 +139,18 @@ async def process_download_task(task: dict) -> Optional[int]:
         # - Fallback: обычный download_to_file через yt-dlp Python API
         logger.info(f"[worker] Исполняю DownloadPlan через YtDlpService")
         
-        # Пробуем сначала потоковое скачивание в память (для маленьких файлов)
-        result = ytdlp_service.download_to_stream(download_plan)
-        
-        # Если потоковое скачивание не сработало, пробуем pipelined метод (быстрее для больших файлов)
-        if not result:
+        is_shorts = getattr(download_plan, 'quality', None) == 'shorts'
+        result = None
+        if not is_shorts:
+            result = ytdlp_service.download_to_stream(download_plan)
+        if not result and not is_shorts:
             logger.info(f"[worker] Потоковое скачивание не удалось, пробую pipelined метод (оптимизированный subprocess)")
             result = await ytdlp_service.download_to_file_pipelined(download_plan)
-        
-        # Если pipelined не сработал, пробуем обычный метод через yt-dlp Python API (fallback)
         if not result:
-            logger.warning(f"[worker] Pipelined метод не удался, пробую через yt-dlp Python API (fallback)")
+            if is_shorts:
+                logger.info(f"[worker] Shorts: качаю в файл через yt-dlp Python API (HLS)")
+            else:
+                logger.warning(f"[worker] Pipelined не удался, пробую yt-dlp Python API (fallback)")
             result = ytdlp_service.download_to_file(download_plan)
         
         if not result:
