@@ -23,6 +23,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      BOT_USERNAME: ${BOT_USERNAME}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       # Если не используешь Postgres/аналитику на сервере, эти переменные можно не задавать
@@ -46,6 +47,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      BOT_USERNAME: ${BOT_USERNAME}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
@@ -68,6 +70,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      BOT_USERNAME: ${BOT_USERNAME}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
