@@ -58,6 +58,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - ./downloads:/app/downloads
+      - ./cookies:/app/cookies:ro
     restart: unless-stopped
     command: ["python", "main.py"]
 
@@ -87,6 +88,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - ./downloads:/app/downloads
+      - ./cookies:/app/cookies:ro
     restart: unless-stopped
     command: ["python", "-m", "src.workers.download_worker"]
 
@@ -116,6 +118,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - ./downloads:/app/downloads
+      - ./cookies:/app/cookies:ro
     restart: unless-stopped
     command: ["python", "-m", "src.workers.download_worker"]
 

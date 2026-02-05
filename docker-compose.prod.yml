@@ -11,7 +11,7 @@ services:
     POSTGRES_DB: ${POSTGRES_DB:-analytics}
     POSTGRES_USER: ${POSTGRES_USER:-postgres}
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    INSTAGRAM_COOKIES_FILE: /cookies/instagram.txt
+    INSTAGRAM_COOKIES_FILE: /app/cookies/cookies.txt
   # Redis для кэширования и очередей (внутри compose‑сети, без проброса порта наружу)
   redis:
     image: redis:7-alpine

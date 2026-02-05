@@ -106,6 +106,12 @@ class InstagramService(BaseService):
             info_opts['extractor_args'] = {'instagram': {'webpage_download': False}}
         except:
             pass
+
+        # Используем те же cookies, что и при скачивании,
+        # чтобы запрос info проходил под залогиненным аккаунтом.
+        cookiefile = self._get_instagram_cookiefile()
+        if cookiefile:
+            info_opts['cookiefile'] = cookiefile
         
         return info_opts
     
@@ -140,9 +146,9 @@ class InstagramService(BaseService):
             pass
 
         # Добавляем опции для обхода ограничений Instagram:
-        # путь к cookies-файлу берём из переменной окружения INSTAGRAM_COOKIES_FILE,
-        # чтобы можно было прокинуть его в контейнер через volume.
-        cookiefile = os.getenv('INSTAGRAM_COOKIES_FILE')
+        # 1) сначала пробуем переменную окружения INSTAGRAM_COOKIES_FILE
+        # 2) если её нет, используем репозиторный файл cookies/cookies.txt, если он существует.
+        cookiefile = self._get_instagram_cookiefile()
         if cookiefile:
             ydl_opts['cookiefile'] = cookiefile
         else:
@@ -151,6 +157,30 @@ class InstagramService(BaseService):
         ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
         return ydl_opts
+
+    def _get_instagram_cookiefile(self) -> Optional[str]:
+        """
+        Определить путь к cookies-файлу для Instagram.
+        Приоритет:
+        1) переменная окружения INSTAGRAM_COOKIES_FILE
+        2) файл репозитория cookies/cookies.txt (если существует)
+        """
+        # 1. Переменная окружения (используется в docker-compose.prod)
+        cookiefile = os.getenv('INSTAGRAM_COOKIES_FILE')
+        if cookiefile:
+            return cookiefile
+
+        # 2. Файл в репозитории: ./cookies/cookies.txt
+        try:
+            # instagram.py лежит в src/services/, нужно подняться на два уровня до корня проекта
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            default_path = os.path.join(base_dir, 'cookies', 'cookies.txt')
+            if os.path.exists(default_path):
+                return default_path
+        except Exception:
+            pass
+
+        return None
     
     # Методы для обратной совместимости (будут удалены)
     def get_video_id(self, url: str) -> Optional[str]:
