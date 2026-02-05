@@ -4,6 +4,7 @@
 Знает только Instagram, формирует DownloadPlan
 """
 import logging
+import os
 from typing import Optional, Dict, Any
 from src.models.download_plan import DownloadPlan
 from .base import BaseService
@@ -135,13 +136,20 @@ class InstagramService(BaseService):
         # Специальные опции для Instagram
         try:
             ydl_opts['extractor_args'] = {'instagram': {'webpage_download': False}}
-        except:
+        except Exception:
             pass
-        
-        # Добавляем опции для обхода ограничений Instagram
-        ydl_opts['cookiefile'] = None  # Можно указать путь к cookies файлу
+
+        # Добавляем опции для обхода ограничений Instagram:
+        # путь к cookies-файлу берём из переменной окружения INSTAGRAM_COOKIES_FILE,
+        # чтобы можно было прокинуть его в контейнер через volume.
+        cookiefile = os.getenv('INSTAGRAM_COOKIES_FILE')
+        if cookiefile:
+            ydl_opts['cookiefile'] = cookiefile
+        else:
+            ydl_opts['cookiefile'] = None
+
         ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        
+
         return ydl_opts
     
     # Методы для обратной совместимости (будут удалены)

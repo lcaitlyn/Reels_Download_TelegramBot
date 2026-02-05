@@ -131,10 +131,15 @@ class YtDlpService:
                 instagram_args = extractor_args['instagram']
                 if instagram_args.get('webpage_download') is False:
                     cmd.extend(['--extractor-args', 'instagram:webpage_download=False'])
-        
+
         # Добавляем user-agent если указан
         if ydl_opts.get('user_agent'):
             cmd.extend(['--user-agent', ydl_opts['user_agent']])
+
+        # Добавляем cookies-файл, если указан (для Instagram и др.)
+        cookiefile = ydl_opts.get('cookiefile')
+        if cookiefile:
+            cmd.extend(['--cookies', cookiefile])
         
         # Добавляем URL в конец
         cmd.append(url)
@@ -587,13 +592,13 @@ class YtDlpService:
         
         if ydl_opts.get('quiet') is not False:
             cmd.append('--quiet')
-        
+
         if ydl_opts.get('no_warnings') is not False:
             cmd.append('--no-warnings')
-        
+
         if ydl_opts.get('noplaylist'):
             cmd.append('--no-playlist')
-        
+
         # Добавляем extractor_args для Instagram
         if 'extractor_args' in ydl_opts:
             extractor_args = ydl_opts['extractor_args']
@@ -601,10 +606,15 @@ class YtDlpService:
                 instagram_args = extractor_args['instagram']
                 if instagram_args.get('webpage_download') is False:
                     cmd.extend(['--extractor-args', 'instagram:webpage_download=False'])
-        
+
         # Добавляем user-agent если указан
         if ydl_opts.get('user_agent'):
             cmd.extend(['--user-agent', ydl_opts['user_agent']])
+
+        # Добавляем cookies-файл, если указан (для Instagram и др.)
+        cookiefile = ydl_opts.get('cookiefile')
+        if cookiefile:
+            cmd.extend(['--cookies', cookiefile])
         
         # Добавляем URL в конец
         cmd.append(url)
