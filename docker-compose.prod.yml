@@ -1,17 +1,12 @@
+x-common-env: &common-env
+  BOT_TOKEN: ${BOT_TOKEN}
+  TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+  BOT_USERNAME: ${BOT_USERNAME}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  INSTAGRAM_COOKIES_FILE: /app/cookies/cookies.txt
+
 services:
-  # Общие переменные окружения для bot/worker1/worker2
-  x-common-env: &common-env
-    BOT_TOKEN: ${BOT_TOKEN}
-    TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
-    BOT_USERNAME: ${BOT_USERNAME}
-    REDIS_HOST: redis
-    REDIS_PORT: 6379
-    POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-    POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-    POSTGRES_DB: ${POSTGRES_DB:-analytics}
-    POSTGRES_USER: ${POSTGRES_USER:-postgres}
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    INSTAGRAM_COOKIES_FILE: /app/cookies/cookies.txt
   # Redis для кэширования и очередей (внутри compose‑сети, без проброса порта наружу)
   redis:
     image: redis:7-alpine
@@ -26,7 +21,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # Основной Telegram‑бот (здесь один раз собирается образ, его используют и workers)
+  # Основной Telegram‑бот (образ один, общий с воркерами)
   bot:
     build: .
     image: downloader_bot_app
@@ -57,7 +52,7 @@ services:
     restart: unless-stopped
     command: ["python", "-m", "src.workers.download_worker"]
 
-  # Worker для скачивания видео (2) — можно удалить или скейлить через --scale
+  # Worker для скачивания видео (2)
   worker2:
     image: downloader_bot_app
     container_name: downloader_bot_worker2
