@@ -53,7 +53,14 @@ class YtDlpService:
             Словарь с информацией о видео или None при ошибке
         """
         if ydl_opts is None:
-            ydl_opts = {'quiet': True, 'extract_flat': False}
+            # По умолчанию НЕ скрываем вывод ошибок yt-dlp.
+            # Это помогает диагностировать проблемы (особенно с cookies для Instagram).
+            ydl_opts = {
+                'verbose': True,
+                'quiet': False,
+                'no_warnings': False,
+                'extract_flat': False,
+            }
         
         try:
             import time
@@ -107,19 +114,17 @@ class YtDlpService:
         ydl_opts = download_plan.ydl_opts.copy() if download_plan.ydl_opts else {}
         
         # Обрабатываем специальные опции
-        # quiet: по умолчанию True для потокового скачивания (меньше логов)
-        if ydl_opts.get('quiet') is False:
-            # Если явно указано quiet=False, не добавляем --quiet
-            pass
-        else:
-            # По умолчанию используем --quiet для потокового скачивания
+        # quiet / no_warnings: по умолчанию НЕ подавляем вывод,
+        # чтобы видеть ошибки (особенно для Instagram).
+        if ydl_opts.get('quiet'):
             cmd.append('--quiet')
         
-        # no_warnings: по умолчанию True
-        if ydl_opts.get('no_warnings') is False:
-            pass  # Не добавляем --no-warnings
-        else:
+        if ydl_opts.get('no_warnings'):
             cmd.append('--no-warnings')
+
+        # verbose: если включён в ydl_opts, пробрасываем в yt-dlp
+        if ydl_opts.get('verbose'):
+            cmd.append('--verbose')
         
         if ydl_opts.get('noplaylist'):
             cmd.append('--no-playlist')
@@ -589,12 +594,18 @@ class YtDlpService:
         
         # Добавляем опции из download_plan.ydl_opts
         ydl_opts = download_plan.ydl_opts.copy() if download_plan.ydl_opts else {}
-        
-        if ydl_opts.get('quiet') is not False:
+
+        # quiet / no_warnings: по умолчанию НЕ подавляем вывод,
+        # чтобы видеть ошибки (особенно для Instagram).
+        if ydl_opts.get('quiet'):
             cmd.append('--quiet')
 
-        if ydl_opts.get('no_warnings') is not False:
+        if ydl_opts.get('no_warnings'):
             cmd.append('--no-warnings')
+
+        # verbose: если включён в ydl_opts, пробрасываем в yt-dlp
+        if ydl_opts.get('verbose'):
+            cmd.append('--verbose')
 
         if ydl_opts.get('noplaylist'):
             cmd.append('--no-playlist')

@@ -97,8 +97,11 @@ class InstagramService(BaseService):
     def _get_info_opts_for_instagram(self) -> Dict[str, Any]:
         """Получить опции для получения информации о видео Instagram"""
         info_opts = {
-            'quiet': False,  # Включаем вывод для отладки
-            'no_warnings': False,
+            # ВАЖНО: для отладки Instagram используем подробный вывод yt-dlp
+            # Аналогично совету из issue: удаляем quiet и включаем verbose
+            'verbose': True,
+            'quiet': False,
+            'no_warnings': False,  # Показываем предупреждения
             'extract_flat': False,
         }
         
@@ -127,7 +130,10 @@ class InstagramService(BaseService):
         """
         ydl_opts = {
             'format': format_selector,
-            'quiet': False,  # Включаем вывод для отладки Instagram
+            # ВАЖНО: следуем рекомендациям yt-dlp для отладки Instagram:
+            # не используем quiet=True и явно включаем verbose-режим
+            'verbose': True,
+            'quiet': False,
             'no_warnings': False,  # Показываем предупреждения
             'noplaylist': True,
             'extract_flat': False,
