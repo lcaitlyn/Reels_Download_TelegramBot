@@ -31,15 +31,192 @@ class YtDlpService:
     НЕ знает о платформах, пользователях, Redis, Telegram.
     """
     
-    def __init__(self, download_dir: str = "downloads", max_file_size_mb: float = 1000.0):
+    def __init__(self, download_dir: str = "downloads", max_file_size_mb: Optional[float] = None):
         """
         Args:
             download_dir: Директория для временных файлов
-            max_file_size_mb: Максимальный размер файла в МБ
+            max_file_size_mb: Максимальный размер файла в МБ (если None — из конфига/MAX_FILE_SIZE_MB)
         """
         self.download_dir = download_dir
+        if max_file_size_mb is None:
+            from src.config import get_max_file_size_mb
+            max_file_size_mb = get_max_file_size_mb()
         self.max_file_size_mb = max_file_size_mb
         os.makedirs(download_dir, exist_ok=True)
+        # Расширения, которые мы считаем потенциальными выходными файлами yt-dlp
+        self._video_audio_exts = ('mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3')
+
+    # === Вспомогательные методы для очистки и поиска файлов ===
+
+    def _cleanup_paths(self, *paths: str) -> None:
+        """Удалить указанные файлы, тихо игнорируя ошибки."""
+        for path in paths:
+            if not path:
+                continue
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.warning(f"[YtDlpService] Не удалось удалить файл {path}: {e}")
+
+    def _cleanup_temp_family(self, base_path: str) -> None:
+        """Удалить базовый временный файл и все варианты с расширениями."""
+        for ext in self._video_audio_exts:
+            self._cleanup_paths(f"{base_path}.{ext}")
+        self._cleanup_paths(base_path)
+
+    def _exceeds_size_limit(self, file_size_bytes: int) -> bool:
+        """Проверить, превышает ли размер файла лимит (в МБ)."""
+        if file_size_bytes <= 0:
+            return False
+        limit_bytes = self.max_file_size_mb * (1024 * 1024)
+        return file_size_bytes > limit_bytes
+
+    def _create_tmp_path(
+        self,
+        download_plan: DownloadPlan,
+        output_path: Optional[str],
+        *,
+        with_extension: bool,
+    ) -> str:
+        """
+        Создать (или использовать переданный) временный путь для скачивания.
+        
+        Args:
+            download_plan: План скачивания (нужен для metadata.ext при with_extension=True)
+            output_path: Явно заданный путь (если есть — просто возвращаем его)
+            with_extension: Если True — создаём файл с расширением (используется обычным download_to_file),
+                            если False — без расширения (pipelined-режим сам добавляет %(ext)s)
+        """
+        if output_path:
+            return output_path
+
+        if with_extension:
+            if download_plan.metadata:
+                ext = download_plan.metadata.get('ext', 'mp4') or 'mp4'
+            else:
+                ext = 'mp4'
+            suffix = f'.{ext}'
+        else:
+            suffix = ''
+
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=self.download_dir)
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        return tmp_path
+
+    def _build_filename(
+        self,
+        download_plan: DownloadPlan,
+        actual_file_path: str,
+    ) -> tuple[str, str]:
+        """
+        Построить имя файла и расширение на основе пути и DownloadPlan.
+        
+        Returns:
+            (filename, actual_ext)
+        """
+        _, actual_ext = os.path.splitext(actual_file_path)
+        actual_ext = actual_ext.lstrip('.') if actual_ext else 'mp4'
+
+        if download_plan.metadata:
+            video_id = download_plan.metadata.get('id', 'video')
+        else:
+            # Извлекаем из video_id (формат: platform:video_id)
+            parts = download_plan.video_id.split(':', 1)
+            video_id = parts[1] if len(parts) > 1 else 'video'
+
+        filename = f"{video_id}.{actual_ext}"
+        return filename, actual_ext
+
+    def _find_output_file(self, base_path: str) -> Optional[str]:
+        """
+        Найти фактический файл, созданный yt-dlp.
+        Сначала пробуем base_path.ext, затем сам base_path.
+        """
+        for ext in self._video_audio_exts:
+            candidate = f"{base_path}.{ext}"
+            if os.path.exists(candidate):
+                return candidate
+        return base_path if os.path.exists(base_path) else None
+
+    # === Платформенные ретраи ===
+
+    def _retry_youtube_shorts_download(
+        self,
+        url: str,
+        tmp_path: str,
+        ydl_opts: Dict[str, Any],
+        alt_formats: Optional[list[str]] = None,
+    ) -> Optional[str]:
+        """
+        Специальные ретраи для YouTube Shorts: пробуем несколько формат-селекторов.
+        
+        Возвращает путь к файлу или None при неудаче.
+        """
+        logger.warning("[YtDlpService] Пробую альтернативные форматы для YouTube Shorts")
+        if alt_formats is None:
+            alt_formats = [
+                'best[height<=1280][ext=mp4]/best[height<=1280]/best',
+                'best[ext=mp4]/best',
+                'best',
+            ]
+        for alt_format in alt_formats:
+            logger.info(f"[YtDlpService] Пробую формат: {alt_format}")
+            self._cleanup_temp_family(tmp_path)
+            ydl_opts['format'] = alt_format
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                actual_file_path = self._find_output_file(tmp_path)
+                file_size = os.path.getsize(actual_file_path) if actual_file_path and os.path.exists(actual_file_path) else 0
+                if actual_file_path and file_size > 0:
+                    logger.info(
+                        f"[YtDlpService] ✅ Shorts скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB"
+                    )
+                    return actual_file_path
+            except Exception as alt_e:
+                logger.warning(f"[YtDlpService] Ошибка с форматом {alt_format}: {alt_e}")
+                continue
+        # Ничего не сработало
+        self._cleanup_temp_family(tmp_path)
+        return None
+
+    def _retry_instagram_download(self, url: str, tmp_path: str, ydl_opts: Dict[str, Any]) -> Optional[str]:
+        """
+        Специальные ретраи для Instagram: пробуем несколько формат-селекторов.
+        
+        Возвращает путь к файлу или None при неудаче.
+        """
+        logger.warning("[YtDlpService] Пробую альтернативные форматы для Instagram")
+        alt_formats = ['best', 'worst', 'best[ext=mp4]', 'worst[ext=mp4]', 'bestvideo+bestaudio/best']
+
+        for alt_format in alt_formats:
+            logger.info(f"[YtDlpService] Пробую альтернативный формат: {alt_format}")
+            # Удаляем файлы перед каждой попыткой
+            self._cleanup_temp_family(tmp_path)
+
+            ydl_opts['format'] = alt_format
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+
+                actual_file_path = self._find_output_file(tmp_path)
+                file_size = os.path.getsize(actual_file_path) if actual_file_path and os.path.exists(actual_file_path) else 0
+
+                if actual_file_path and file_size > 0:
+                    logger.info(
+                        f"[YtDlpService] ✅ Успешно скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB"
+                    )
+                    return actual_file_path
+            except Exception as e:
+                logger.warning(f"[YtDlpService] Ошибка при скачивании с форматом {alt_format}: {e}")
+                continue
+
+        logger.error("[YtDlpService] ❌ Не удалось скачать видео ни с одним форматом (Instagram)")
+        self._cleanup_temp_family(tmp_path)
+        return None
     
     def get_info(self, url: str, ydl_opts: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -52,9 +229,8 @@ class YtDlpService:
         Returns:
             Словарь с информацией о видео или None при ошибке
         """
+        #TODO какого хуя тут настройки? они должны настраивается в конкретном сервисе
         if ydl_opts is None:
-            # По умолчанию НЕ скрываем вывод ошибок yt-dlp.
-            # Это помогает диагностировать проблемы (особенно с cookies для Instagram).
             ydl_opts = {
                 'verbose': True,
                 'quiet': False,
@@ -63,7 +239,6 @@ class YtDlpService:
             }
         
         try:
-            import time
             start_time = time.time()
             logger.info(f"[extract_info] Начало получения информации: {url}")
             
@@ -76,6 +251,206 @@ class YtDlpService:
             return info
         except Exception as e:
             logger.error(f"Ошибка при получении информации о видео {url}: {e}", exc_info=True)
+            return None
+
+    async def get_info_async(
+        self, url: str, ydl_opts: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Асинхронная обёртка над get_info: выполняет в executor, чтобы не блокировать event loop.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: self.get_info(url, ydl_opts))
+
+
+    def get_video_info(self, url: str, ydl_opts: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Backwards-compatible обертка для get_info().
+        Используется старыми сервисами/юзкейсами, ожидающими VideoDownloader.
+        """
+        return self.get_info(url, ydl_opts)
+
+    def get_video_id(self, url: str) -> Optional[str]:
+        """
+        Получить канонический ID видео через yt-dlp extractor
+
+        Args:
+            url: URL видео
+        Returns:
+            Идентификатор в формате "platform:video_id".
+        """
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+            }
+            
+            start_time = time.time()
+            logger.info(f"[extract_info] Начало получения video_id: {url}")
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"[extract_info] video_id получен за {elapsed_time:.2f} сек: {url}")
+            
+            video_id = info.get('id')
+            platform = info.get('extractor_key', 'unknown').lower()
+            
+            if video_id and platform:
+                canonical_id = f"{platform}:{video_id}"
+                logger.info(f"Канонический ID для {url}: {canonical_id}")
+                return canonical_id
+                    
+        except Exception as e:
+            logger.warning(f"Не удалось получить канонический ID для {url}: {e}")
+        
+        return None
+
+    def get_available_formats(
+        self,
+        url: str,
+        ydl_opts: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Получить доступные форматы для видео (совместимо с VideoDownloader.get_available_formats).
+        
+        Returns:
+            Словарь с форматами вида:
+            {
+                '480p': {'format_id': '...', 'filesize': ...},
+                '720p': {'format_id': '...', 'filesize': ...},
+                '1080p': {'format_id': '...', 'filesize': ...},
+                'audio': {'format_id': '...', 'filesize': ...}
+            }
+        """
+        if ydl_opts is None:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+                'listformats': True,
+            }
+        
+        try:
+            formats_dict: Dict[str, Any] = {}
+            
+            start_time = time.time()
+            logger.info(f"[extract_info] Начало получения информации о форматах: {url}")
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                
+            elapsed_time = time.time() - start_time
+            logger.info(f"[extract_info] Информация о форматах получена за {elapsed_time:.2f} сек: {url}")
+            
+            formats = info.get('formats', [])
+            
+            video_formats: Dict[int, list] = {}
+            audio_formats = []
+            
+            for fmt in formats:
+                height = fmt.get('height')
+                vcodec = fmt.get('vcodec', 'none')
+                acodec = fmt.get('acodec', 'none')
+                format_id = fmt.get('format_id')
+                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+                ext = fmt.get('ext', 'mp4')
+                
+                if vcodec == 'none' and acodec != 'none' and ext in ['m4a', 'webm', 'mp3']:
+                    audio_formats.append({
+                        'format_id': format_id,
+                        'filesize': filesize,
+                        'ext': ext
+                    })
+                
+                if vcodec != 'none' and height:
+                    if height not in video_formats:
+                        video_formats[height] = []
+                    video_formats[height].append({
+                        'format_id': format_id,
+                        'filesize': filesize,
+                        'ext': ext,
+                        'height': height,
+                        'has_audio': acodec != 'none'
+                    })
+            
+            is_shorts = 'shorts' in url.lower()
+            if is_shorts:
+                target_heights_with_labels = [(1280, '720p'), (1920, '1080p')]
+            else:
+                target_heights_with_labels = [
+                    ([480, 854], '480p'),
+                    ([720, 1280], '720p'),
+                    ([1080, 1920], '1080p'),
+                ]
+            
+            for item, height_label in target_heights_with_labels:
+                heights_to_use = [item] if isinstance(item, int) else list(item)
+                
+                candidates = []
+                for h in heights_to_use:
+                    if h in video_formats:
+                        candidates.extend(video_formats[h])
+                
+                if not candidates:
+                    continue
+                
+                formats_with_audio = [f for f in candidates if f.get('has_audio', False)]
+                if formats_with_audio:
+                    best_format = min(
+                        formats_with_audio,
+                        key=lambda x: x['filesize'] if x['filesize'] else float('inf')
+                    )
+                    if height_label not in formats_dict:
+                        formats_dict[height_label] = {
+                            'format_id': best_format['format_id'],
+                            'filesize': best_format['filesize'],
+                            'ext': best_format['ext'],
+                            'height': best_format.get('height')
+                        }
+                else:
+                    video_only = [f for f in candidates if not f.get('has_audio', False)]
+                    if video_only:
+                        best_format = min(
+                            video_only,
+                            key=lambda x: x['filesize'] if x['filesize'] else float('inf')
+                        )
+                        if height_label not in formats_dict:
+                            formats_dict[height_label] = {
+                                'format_id': best_format['format_id'],
+                                'filesize': best_format['filesize'],
+                                'ext': best_format['ext'],
+                                'height': best_format.get('height'),
+                                'needs_audio': True
+                            }
+            
+            if audio_formats and not is_shorts:
+                quality_audio = [f for f in audio_formats if f.get('filesize', 0) > 1000000]
+                
+                if quality_audio:
+                    best_audio = max(
+                        quality_audio,
+                        key=lambda x: x['filesize'] if x['filesize'] else 0
+                    )
+                else:
+                    best_audio = max(
+                        audio_formats,
+                        key=lambda x: x['filesize'] if x['filesize'] else 0
+                    )
+                
+                formats_dict['audio'] = {
+                    'format_id': best_audio['format_id'],
+                    'filesize': best_audio['filesize'],
+                    'ext': best_audio['ext']
+                }
+            
+            logger.info(f"Доступные форматы для {url}: {list(formats_dict.keys())}")
+            return formats_dict if formats_dict else None
+                
+        except Exception as e:
+            logger.error(f"Ошибка при получении форматов для {url}: {e}", exc_info=True)
             return None
     
     def download_to_stream(
@@ -242,14 +617,19 @@ class YtDlpService:
                 ext = 'mp4'
             
             filename = f"{video_id}.{ext}"
-            
+
             if file_size == 0:
                 logger.error("[YtDlpService] Скачанный файл пустой")
                 return None
-            
+            if self._exceeds_size_limit(file_size):
+                logger.error(
+                    f"[YtDlpService] Размер файла {file_size / (1024 * 1024):.1f} MB превышает лимит {self.max_file_size_mb} MB"
+                )
+                return None
+
             logger.info(f"[YtDlpService] Видео загружено в память: {file_size / (1024 * 1024):.2f} MB")
             return (buffer, file_size, filename)
-            
+
         except FileNotFoundError:
             logger.warning("[YtDlpService] yt-dlp не найден в PATH, используем download_to_file")
             return None
@@ -277,21 +657,8 @@ class YtDlpService:
         
         logger.info(f"[YtDlpService] Скачиваю в файл: {url} (формат: {format_selector})")
         
-        # Определяем путь к файлу
-        if output_path:
-            tmp_path = output_path
-        else:
-            # Создаем временный файл
-            if download_plan.metadata:
-                ext = download_plan.metadata.get('ext', 'mp4') or 'mp4'
-            else:
-                ext = 'mp4'
-            
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}', dir=self.download_dir)
-            tmp_path = tmp_file.name
-            tmp_file.close()
+        tmp_path = self._create_tmp_path(download_plan, output_path, with_extension=True)
         
-        # Удаляем файл, если он существует (чтобы yt-dlp не думал, что он уже скачан)
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -299,15 +666,11 @@ class YtDlpService:
             except Exception as e:
                 logger.warning(f"[YtDlpService] Не удалось удалить существующий файл {tmp_path}: {e}")
         
-        # Формируем опции yt-dlp
         ydl_opts = download_plan.ydl_opts.copy()
         ydl_opts['format'] = format_selector
-        # Используем шаблон с %(ext)s, чтобы yt-dlp сам определил правильное расширение
-        # Это важно для audio-only файлов (m4a, webm, opus и т.д.)
         ydl_opts['outtmpl'] = f"{tmp_path}.%(ext)s"
-        # Важно: отключаем продолжение скачивания и частичные файлы
-        ydl_opts['nopart'] = True  # Не создавать частичные файлы
-        ydl_opts['continue_dl'] = False  # Не продолжать скачивание
+        ydl_opts['nopart'] = True 
+        ydl_opts['continue_dl'] = False
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -315,234 +678,64 @@ class YtDlpService:
         except yt_dlp.utils.DownloadError as e:
             error_msg = str(e)
             logger.error(f"[YtDlpService] ❌ yt-dlp DownloadError при скачивании {url}: {error_msg}")
-            
-            # YouTube Shorts: один готовый поток без мержа (без ffmpeg)
+
+            actual_file_path = None
+
             if download_plan.platform == 'youtube' and getattr(download_plan, 'quality', None) == 'shorts':
-                logger.warning(f"[YtDlpService] Пробую альтернативные форматы для YouTube Shorts")
-                alt_formats = ['best[height<=1280][ext=mp4]/best[height<=1280]/best', 'best[ext=mp4]/best', 'best']
-                for alt_format in alt_formats:
-                    logger.info(f"[YtDlpService] Пробую формат: {alt_format}")
-                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                        candidate_path = f"{tmp_path}.{ext}"
-                        if os.path.exists(candidate_path):
-                            try:
-                                os.remove(candidate_path)
-                            except Exception:
-                                pass
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                    ydl_opts['format'] = alt_format
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([url])
-                        actual_file_path = None
-                        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                            candidate_path = f"{tmp_path}.{ext}"
-                            if os.path.exists(candidate_path):
-                                actual_file_path = candidate_path
-                                break
-                        if not actual_file_path and os.path.exists(tmp_path):
-                            actual_file_path = tmp_path
-                        file_size = os.path.getsize(actual_file_path) if actual_file_path and os.path.exists(actual_file_path) else 0
-                        if file_size > 0:
-                            logger.info(f"[YtDlpService] ✅ Shorts скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
-                            tmp_path = actual_file_path
-                            break
-                    except Exception as alt_e:
-                        logger.warning(f"[YtDlpService] Ошибка с форматом {alt_format}: {alt_e}")
-                        continue
-                else:
-                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                        candidate_path = f"{tmp_path}.{ext}"
-                        if os.path.exists(candidate_path):
-                            try:
-                                os.remove(candidate_path)
-                            except Exception:
-                                pass
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                    return None
-            # Для Instagram пробуем альтернативные форматы
+                actual_file_path = self._retry_youtube_shorts_download(url, tmp_path, ydl_opts)
+            
             elif download_plan.platform == 'instagram':
-                logger.warning(f"[YtDlpService] Пробую альтернативные форматы для Instagram")
-                alt_formats = ['best', 'worst', 'best[ext=mp4]', 'worst[ext=mp4]', 'bestvideo+bestaudio/best']
-                
-                for alt_format in alt_formats:
-                    logger.info(f"[YtDlpService] Пробую альтернативный формат: {alt_format}")
-                    # Удаляем файл перед каждой попыткой
-                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                        candidate_path = f"{tmp_path}.{ext}"
-                        if os.path.exists(candidate_path):
-                            try:
-                                os.remove(candidate_path)
-                            except:
-                                pass
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except:
-                            pass
-                    
-                    ydl_opts['format'] = alt_format
-                    
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([url])
-                        
-                        # Ищем файл с расширением
-                        actual_file_path = None
-                        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                            candidate_path = f"{tmp_path}.{ext}"
-                            if os.path.exists(candidate_path):
-                                actual_file_path = candidate_path
-                                break
-                        if not actual_file_path and os.path.exists(tmp_path):
-                            actual_file_path = tmp_path
-                        
-                        file_size = os.path.getsize(actual_file_path) if actual_file_path and os.path.exists(actual_file_path) else 0
-                        if file_size > 0:
-                            logger.info(f"[YtDlpService] ✅ Успешно скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
-                            tmp_path = actual_file_path  # Обновляем путь для дальнейшей обработки
-                            break
-                    except Exception as e:
-                        logger.warning(f"[YtDlpService] Ошибка при скачивании с форматом {alt_format}: {e}")
-                        continue
-                else:
-                    # Все форматы не сработали
-                    logger.error("[YtDlpService] ❌ Не удалось скачать видео ни с одним форматом")
-                    # Удаляем все возможные файлы с расширениями
-                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                        candidate_path = f"{tmp_path}.{ext}"
-                        if os.path.exists(candidate_path):
-                            try:
-                                os.remove(candidate_path)
-                            except:
-                                pass
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except:
-                            pass
-                    return None
+                actual_file_path = self._retry_instagram_download(url, tmp_path, ydl_opts)
             else:
-                # Для других платформ просто возвращаем ошибку
-                # Удаляем все возможные файлы с расширениями
-                for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                    candidate_path = f"{tmp_path}.{ext}"
-                    if os.path.exists(candidate_path):
-                        try:
-                            os.remove(candidate_path)
-                        except:
-                            pass
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except:
-                        pass
+                self._cleanup_temp_family(tmp_path)
                 return None
+
+            if not actual_file_path:
+                return None
+            tmp_path = actual_file_path
+
         except Exception as e:
             logger.error(f"[YtDlpService] ❌ Неожиданная ошибка при скачивании {url}: {e}", exc_info=True)
-            # Удаляем все возможные файлы с расширениями
-            for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                candidate_path = f"{tmp_path}.{ext}"
-                if os.path.exists(candidate_path):
-                    try:
-                        os.remove(candidate_path)
-                    except:
-                        pass
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except:
-                    pass
+            self._cleanup_temp_family(tmp_path)
             return None
-        
-        # yt-dlp создал файл с расширением, определяем реальный путь
-        # Ищем файл с расширением (yt-dlp добавил .%(ext)s к tmp_path)
-        actual_file_path = None
-        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-            candidate_path = f"{tmp_path}.{ext}"
-            if os.path.exists(candidate_path):
-                actual_file_path = candidate_path
-                break
-        
-        # Если не нашли файл с расширением, проверяем оригинальный путь
+
+        # Определяем фактический путь к скачанному файлу
+        actual_file_path = self._find_output_file(tmp_path)
         if not actual_file_path:
-            if os.path.exists(tmp_path):
-                actual_file_path = tmp_path
-            else:
-                logger.error("[YtDlpService] Скачанный файл не найден")
-                return None
-        
-        # Проверяем размер файла
+            logger.error("[YtDlpService] Скачанный файл не найден")
+            return None
+
         file_size = os.path.getsize(actual_file_path) if os.path.exists(actual_file_path) else 0
-        
+
         if file_size == 0 and download_plan.platform == 'youtube' and getattr(download_plan, 'quality', None) == 'shorts':
-            try:
-                if actual_file_path != tmp_path:
-                    os.remove(actual_file_path)
-            except Exception:
-                pass
-            logger.warning("[YtDlpService] Shorts: файл пустой, пробую альтернативные форматы")
-            for alt_format in ['best[ext=mp4]/best', 'best']:
-                ydl_opts['format'] = alt_format
-                for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                    p = f"{tmp_path}.{ext}"
-                    if os.path.exists(p):
-                        try:
-                            os.remove(p)
-                        except Exception:
-                            pass
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([url])
-                except Exception:
-                    continue
-                for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                    candidate_path = f"{tmp_path}.{ext}"
-                    if os.path.exists(candidate_path):
-                        sz = os.path.getsize(candidate_path)
-                        if sz > 0:
-                            actual_file_path = candidate_path
-                            file_size = sz
-                            logger.info(f"[YtDlpService] ✅ Shorts скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
-                            break
-                if file_size > 0:
-                    break
+            # Файл пустой — пробуем ещё несколько, более общих, форматов
+            self._cleanup_paths(actual_file_path if actual_file_path != tmp_path else None)
+            logger.warning("[YtDlpService] Shorts: файл пустой, пробую альтернативные форматы (fallback)")
+            fallback_formats = ['best[ext=mp4]/best', 'best']
+            new_path = self._retry_youtube_shorts_download(url, tmp_path, ydl_opts, alt_formats=fallback_formats)
+            if not new_path:
+                return None
+            actual_file_path = new_path
+            file_size = os.path.getsize(actual_file_path) if os.path.exists(actual_file_path) else 0
+
         if file_size == 0:
             logger.error("[YtDlpService] Скачанный файл пустой")
-            try:
-                if actual_file_path != tmp_path and os.path.exists(actual_file_path):
-                    os.remove(actual_file_path)
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+            self._cleanup_paths(actual_file_path if actual_file_path != tmp_path else None)
+            self._cleanup_temp_family(tmp_path)
             return None
-        
-        # Получаем реальное расширение из имени файла
-        _, actual_ext = os.path.splitext(actual_file_path)
-        actual_ext = actual_ext.lstrip('.') if actual_ext else 'mp4'
-        
-        # Получаем имя файла
-        if download_plan.metadata:
-            video_id = download_plan.metadata.get('id', 'video')
-        else:
-            # Извлекаем из video_id (формат: platform:video_id)
-            parts = download_plan.video_id.split(':', 1)
-            video_id = parts[1] if len(parts) > 1 else 'video'
-        
-        filename = f"{video_id}.{actual_ext}"
-        
+        if self._exceeds_size_limit(file_size):
+            logger.error(
+                f"[YtDlpService] Размер файла {file_size / (1024 * 1024):.1f} MB превышает лимит {self.max_file_size_mb} MB"
+            )
+            self._cleanup_paths(actual_file_path if actual_file_path != tmp_path else None)
+            self._cleanup_temp_family(tmp_path)
+            return None
+
+        filename, actual_ext = self._build_filename(download_plan, actual_file_path)
+
         logger.info(f"[YtDlpService] Видео скачано в файл: {actual_file_path} ({file_size / (1024 * 1024):.2f} MB, расширение: {actual_ext})")
         return (actual_file_path, file_size, filename)
-    
+
     async def download_to_file_pipelined(
         self,
         download_plan: DownloadPlan,
@@ -563,54 +756,26 @@ class YtDlpService:
         """
         url = download_plan.url
         format_selector = download_plan.format_selector
-        
+
         logger.info(f"[YtDlpService] Скачиваю в файл (pipelined): {url} (формат: {format_selector})")
-        
-        # Определяем путь к файлу
-        if output_path:
-            tmp_path = output_path
-        else:
-            # Создаем временный файл БЕЗ расширения - yt-dlp сам определит правильное расширение
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='', dir=self.download_dir)
-            tmp_path = tmp_file.name
-            tmp_file.close()
-        
-        # Удаляем файл, если он существует (и все возможные файлы с расширениями)
-        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-            candidate_path = f"{tmp_path}.{ext}"
-            if os.path.exists(candidate_path):
-                try:
-                    os.remove(candidate_path)
-                except Exception as e:
-                    logger.warning(f"[YtDlpService] Не удалось удалить существующий файл {candidate_path}: {e}")
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception as e:
-                logger.warning(f"[YtDlpService] Не удалось удалить существующий файл {tmp_path}: {e}")
-        
-        # Формируем команду yt-dlp с шаблоном %(ext)s для автоматического определения расширения
+
+        tmp_path = self._create_tmp_path(download_plan, output_path, with_extension=False)
+
+        self._cleanup_temp_family(tmp_path)
+
         cmd = ['yt-dlp', '-f', format_selector, '-o', f"{tmp_path}.%(ext)s"]
-        
-        # Добавляем опции из download_plan.ydl_opts
+
         ydl_opts = download_plan.ydl_opts.copy() if download_plan.ydl_opts else {}
 
-        # quiet / no_warnings: по умолчанию НЕ подавляем вывод,
-        # чтобы видеть ошибки (особенно для Instagram).
         if ydl_opts.get('quiet'):
             cmd.append('--quiet')
-
         if ydl_opts.get('no_warnings'):
             cmd.append('--no-warnings')
-
-        # verbose: если включён в ydl_opts, пробрасываем в yt-dlp
         if ydl_opts.get('verbose'):
             cmd.append('--verbose')
-
         if ydl_opts.get('noplaylist'):
             cmd.append('--no-playlist')
 
-        # Добавляем extractor_args для Instagram
         if 'extractor_args' in ydl_opts:
             extractor_args = ydl_opts['extractor_args']
             if 'instagram' in extractor_args:
@@ -618,20 +783,16 @@ class YtDlpService:
                 if instagram_args.get('webpage_download') is False:
                     cmd.extend(['--extractor-args', 'instagram:webpage_download=False'])
 
-        # Добавляем user-agent если указан
         if ydl_opts.get('user_agent'):
             cmd.extend(['--user-agent', ydl_opts['user_agent']])
 
-        # Добавляем cookies-файл, если указан (для Instagram и др.)
         cookiefile = ydl_opts.get('cookiefile')
         if cookiefile:
             cmd.extend(['--cookies', cookiefile])
-        
-        # Добавляем URL в конец
+
         cmd.append(url)
-        
+
         try:
-            # Запускаем процесс в отдельном потоке для неблокирующего выполнения
             loop = asyncio.get_event_loop()
             process = await loop.run_in_executor(
                 None,
@@ -641,163 +802,54 @@ class YtDlpService:
                     stderr=subprocess.PIPE
                 )
             )
-            
-            # Ждем завершения процесса
+
             returncode = await loop.run_in_executor(None, process.wait)
-            
+
             if returncode != 0:
                 error = process.stderr.read().decode('utf-8', errors='ignore')
                 logger.error(f"[YtDlpService] Ошибка yt-dlp (pipelined): {error}")
-                
-                # Для Instagram пробуем альтернативные форматы
+
                 if download_plan.platform == 'instagram':
-                    logger.warning(f"[YtDlpService] Пробую альтернативные форматы для Instagram (pipelined)")
-                    alt_formats = ['best', 'worst', 'best[ext=mp4]', 'worst[ext=mp4]', 'bestvideo+bestaudio/best']
-                    
-                    for alt_format in alt_formats:
-                        logger.info(f"[YtDlpService] Пробую альтернативный формат: {alt_format}")
-                        # Удаляем все возможные файлы с расширениями
-                        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                            candidate_path = f"{tmp_path}.{ext}"
-                            if os.path.exists(candidate_path):
-                                try:
-                                    os.remove(candidate_path)
-                                except:
-                                    pass
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.remove(tmp_path)
-                            except:
-                                pass
-                        
-                        # Обновляем команду с новым форматом
-                        cmd_alt = cmd.copy()
-                        format_idx = cmd_alt.index('-f')
-                        cmd_alt[format_idx + 1] = alt_format
-                        
-                        try:
-                            process_alt = await loop.run_in_executor(
-                                None,
-                                lambda: subprocess.Popen(
-                                    cmd_alt,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE
-                                )
-                            )
-                            returncode_alt = await loop.run_in_executor(None, process_alt.wait)
-                            
-                            # Ищем файл с расширением
-                            actual_file_path = None
-                            for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                                candidate_path = f"{tmp_path}.{ext}"
-                                if os.path.exists(candidate_path):
-                                    actual_file_path = candidate_path
-                                    break
-                            if not actual_file_path and os.path.exists(tmp_path):
-                                actual_file_path = tmp_path
-                            
-                            if actual_file_path:
-                                file_size = os.path.getsize(actual_file_path)
-                                if file_size > 0:
-                                    logger.info(f"[YtDlpService] ✅ Успешно скачано с форматом {alt_format}: {file_size / (1024 * 1024):.2f} MB")
-                                    tmp_path = actual_file_path  # Обновляем путь
-                                    break
-                        except Exception as e:
-                            logger.warning(f"[YtDlpService] Ошибка при скачивании с форматом {alt_format}: {e}")
-                            continue
-                    else:
-                        logger.error("[YtDlpService] ❌ Не удалось скачать видео ни с одним форматом")
-                        # Удаляем все возможные файлы с расширениями
-                        for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                            candidate_path = f"{tmp_path}.{ext}"
-                            if os.path.exists(candidate_path):
-                                try:
-                                    os.remove(candidate_path)
-                                except:
-                                    pass
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.remove(tmp_path)
-                            except:
-                                pass
+                    actual_file_path = self._retry_instagram_download(url, tmp_path, ydl_opts)
+                    if not actual_file_path:
                         return None
+                    tmp_path = actual_file_path
                 else:
-                    # Удаляем все возможные файлы с расширениями
-                    for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                        candidate_path = f"{tmp_path}.{ext}"
-                        if os.path.exists(candidate_path):
-                            try:
-                                os.remove(candidate_path)
-                            except:
-                                pass
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except:
-                            pass
+                    self._cleanup_temp_family(tmp_path)
                     return None
-            
-            # yt-dlp создал файл с расширением, определяем реальный путь
-            actual_file_path = None
-            for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                candidate_path = f"{tmp_path}.{ext}"
-                if os.path.exists(candidate_path):
-                    actual_file_path = candidate_path
-                    break
-            
-            # Если не нашли файл с расширением, проверяем оригинальный путь
+
+            actual_file_path = self._find_output_file(tmp_path)
             if not actual_file_path:
-                if os.path.exists(tmp_path):
-                    actual_file_path = tmp_path
-                else:
-                    logger.error("[YtDlpService] Скачанный файл не найден (pipelined)")
-                    return None
-            
-            # Проверяем размер файла
+                logger.error("[YtDlpService] Скачанный файл не найден (pipelined)")
+                return None
+
             file_size = os.path.getsize(actual_file_path) if os.path.exists(actual_file_path) else 0
-            
+
             if file_size == 0:
                 logger.error("[YtDlpService] Скачанный файл пустой (pipelined)")
-                try:
-                    if actual_file_path != tmp_path:
-                        os.remove(actual_file_path)
-                    os.remove(tmp_path)
-                except:
-                    pass
+                self._cleanup_paths(actual_file_path if actual_file_path != tmp_path else None)
+                self._cleanup_temp_family(tmp_path)
                 return None
-            
-            # Получаем реальное расширение из имени файла
-            _, actual_ext = os.path.splitext(actual_file_path)
-            actual_ext = actual_ext.lstrip('.') if actual_ext else 'mp4'
-            
-            # Получаем имя файла
-            if download_plan.metadata:
-                video_id = download_plan.metadata.get('id', 'video')
-            else:
-                parts = download_plan.video_id.split(':', 1)
-                video_id = parts[1] if len(parts) > 1 else 'video'
-            
-            filename = f"{video_id}.{actual_ext}"
-            
-            logger.info(f"[YtDlpService] Видео скачано в файл (pipelined): {actual_file_path} ({file_size / (1024 * 1024):.2f} MB, расширение: {actual_ext})")
+            if self._exceeds_size_limit(file_size):
+                logger.error(
+                    f"[YtDlpService] Размер файла {file_size / (1024 * 1024):.1f} MB превышает лимит {self.max_file_size_mb} MB (pipelined)"
+                )
+                self._cleanup_paths(actual_file_path if actual_file_path != tmp_path else None)
+                self._cleanup_temp_family(tmp_path)
+                return None
+
+            filename, actual_ext = self._build_filename(download_plan, actual_file_path)
+
+            logger.info(
+                f"[YtDlpService] Видео скачано в файл (pipelined): "
+                f"{actual_file_path} ({file_size / (1024 * 1024):.2f} MB, расширение: {actual_ext})"
+            )
             return (actual_file_path, file_size, filename)
-            
+
         except FileNotFoundError:
             logger.warning("[YtDlpService] yt-dlp не найден в PATH")
             return None
         except Exception as e:
             logger.error(f"[YtDlpService] Ошибка при pipelined скачивании: {e}", exc_info=True)
-            # Удаляем все возможные файлы с расширениями
-            for ext in ['mp4', 'webm', 'm4a', 'opus', 'mkv', 'mp3']:
-                candidate_path = f"{tmp_path}.{ext}"
-                if os.path.exists(candidate_path):
-                    try:
-                        os.remove(candidate_path)
-                    except:
-                        pass
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except:
-                    pass
+            self._cleanup_temp_family(tmp_path)
             return None

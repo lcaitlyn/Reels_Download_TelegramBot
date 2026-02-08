@@ -21,8 +21,9 @@ class DownloadResponse:
             - IN_PROGRESS: Видео уже скачивается другим пользователем
             - ERROR: Ошибка при обработке
             - REQUIRES_USER_INPUT: Требуется выбор качества (YouTube)
-        file_id: file_id видео в Telegram (если status == READY)
+        file_id: file_id видео/фото/аудио в Telegram (если status == READY)
         message_id: ID сообщения в канале (если status == READY)
+        media_type: Тип контента для отправки: 'video' | 'photo' | 'audio' (если status == READY)
         job_id: ID задачи в очереди (если status == QUEUED или IN_PROGRESS)
         error: Сообщение об ошибке (если status == ERROR)
         available_qualities: Список доступных качеств (если status == REQUIRES_USER_INPUT)
@@ -30,6 +31,7 @@ class DownloadResponse:
     status: str  # READY | QUEUED | IN_PROGRESS | ERROR | REQUIRES_USER_INPUT
     file_id: Optional[str] = None  # если READY
     message_id: Optional[int] = None  # если READY
+    media_type: str = 'video'  # если READY: 'video' | 'photo' | 'audio'
     job_id: Optional[str] = None  # если QUEUED или IN_PROGRESS
     error: Optional[str] = None  # если ERROR
     available_qualities: Optional[List[str]] = None  # если REQUIRES_USER_INPUT

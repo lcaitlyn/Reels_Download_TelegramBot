@@ -33,7 +33,11 @@ class TikTokService(BaseService):
     def extract_video_id(self, url: str) -> Optional[str]:
         """Извлечь канонический ID видео TikTok"""
         return self.downloader.get_video_id(url)
-    
+
+    def get_ydl_opts(self) -> Dict[str, Any]:
+        """Опции yt-dlp для get_info (только информация)."""
+        return {'quiet': True, 'no_warnings': True, 'extract_flat': False}
+
     def get_metadata(self, url: str) -> Optional[Dict[str, Any]]:
         """
         Получить метаданные видео TikTok
@@ -80,6 +84,7 @@ class TikTokService(BaseService):
         # По умолчанию считаем, что можно стримить (для маленьких файлов)
         # Если файл окажется большим, worker переключится на файловый режим
         streamable = True  # Будет переопределено во время скачивания
+        telegram_caption = f"Source: {url}"
         
         return DownloadPlan(
             platform='tiktok',
@@ -87,6 +92,8 @@ class TikTokService(BaseService):
             url=url,
             format_selector=format_selector,
             streamable=streamable,
+            media_type='video',
+            telegram_caption=telegram_caption,
             ydl_opts=ydl_opts,
             metadata=None  # Метаданные будут получены во время скачивания
         )
@@ -113,15 +120,3 @@ class TikTokService(BaseService):
             'writethumbnail': False,
         }
     
-    # Методы для обратной совместимости (будут удалены)
-    def get_video_id(self, url: str) -> Optional[str]:
-        """DEPRECATED: Используйте extract_video_id()"""
-        return self.extract_video_id(url)
-    
-    def get_available_formats(self, url: str) -> Optional[Dict[str, Any]]:
-        """TikTok не поддерживает выбор качества"""
-        return None
-    
-    def get_default_format(self) -> str:
-        """Формат по умолчанию для TikTok"""
-        return 'worst[ext=mp4]/worst[ext=webm]/worst'

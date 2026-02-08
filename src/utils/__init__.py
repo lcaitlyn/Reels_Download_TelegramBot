@@ -6,7 +6,8 @@ from .utils import (
     get_platform,
     is_supported_url,
     is_youtube_video,
-    get_video_id_fast
+    get_video_id_fast,
+    ensure_url_protocol,
 )
 
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     'get_platform',
     'is_supported_url',
     'is_youtube_video',
-    'get_video_id_fast'
+    'get_video_id_fast',
+    'ensure_url_protocol',
 ]

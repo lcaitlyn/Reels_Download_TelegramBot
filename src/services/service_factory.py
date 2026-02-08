@@ -2,7 +2,6 @@
 Фабрика для создания сервисов платформ
 """
 from typing import Optional
-from src.downloader.downloader import VideoDownloader
 from src.services.instagram import InstagramService
 from src.services.tiktok import TikTokService
 from src.services.youtube import YouTubeService
@@ -13,10 +12,11 @@ from src.utils.utils import get_platform
 class ServiceFactory:
     """Фабрика для создания сервисов платформ"""
     
-    def __init__(self, downloader: VideoDownloader):
+    def __init__(self, downloader):
         """
         Args:
-            downloader: Экземпляр VideoDownloader
+            downloader: Объект, предоставляющий методы работы с yt-dlp
+                       (YtDlpService или совместимый по интерфейсу)
         """
         self.downloader = downloader
         self._services = {}

@@ -1,7 +1,3 @@
-"""
-Background Worker для обработки задач на скачивание видео из очереди Redis
-Тупой исполнитель - исполняет DownloadPlan через YtDlpService
-"""
 import os
 import io
 import asyncio
@@ -12,24 +8,19 @@ from aiogram import Bot, types
 from aiogram.client.session.aiohttp import AiohttpSession
 
 from src.database.redis_db import Database
-from src.downloader.downloader import VideoDownloader
-from src.utils.utils import get_platform
 from src.events.events import DownloadCompletedEvent
 from src.services.service_factory import ServiceFactory
 from src.services.link_processing_service import LinkProcessingService
 from src.services.ytdlp_service import YtDlpService
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
 load_dotenv()
 
-# Проверка переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
@@ -38,17 +29,15 @@ if not BOT_TOKEN:
 if not CHANNEL_ID:
     raise ValueError("TELEGRAM_CHANNEL_ID не установлен в переменных окружения")
 
-# Преобразуем CHANNEL_ID в int, если это число
 try:
     CHANNEL_ID = int(CHANNEL_ID)
 except ValueError:
-    pass  # Оставляем строку, если это username канала
+    pass
 
-# Инициализация компонентов
 session = AiohttpSession(timeout=600)
 bot = Bot(token=BOT_TOKEN, session=session)
 db = Database()
-downloader = VideoDownloader()  # Для обратной совместимости (будет удален)
+downloader = YtDlpService()
 service_factory = ServiceFactory(downloader)
 link_processor = LinkProcessingService(service_factory)
 ytdlp_service = YtDlpService()
@@ -85,34 +74,25 @@ async def process_download_task(task: dict) -> Optional[int]:
         logger.error(f"[worker] Невалидная задача: {task}")
         return None
     
-    # Пытаемся получить lock на скачивание (с учетом качества)
-    # ВАЖНО: Lock должен быть получен ДО входа в try, чтобы finally мог его освободить
     got_lock = await db.acquire_download_lock(video_id, quality=quality)
     
     if not got_lock:
-        # Lock не получен - кто-то уже скачивает, не обрабатываем задачу повторно
         logger.info(f"[worker] Lock занят для video_id={video_id}, quality={quality}, пропускаем задачу (кто-то уже скачивает)")
         return None
     
-    # Lock получен - обрабатываем задачу
-    # ВАЖНО: Все return None внутри try будут освобождать lock в finally
     try:
-        # Проверяем кэш еще раз (на случай если пока ждали lock, видео уже скачали)
         cached_message_id = await db.get_cached_message_id(video_id=video_id, quality=quality)
         if cached_message_id and cached_message_id != 0:
             logger.info(f"[worker] Видео уже в кэше: video_id={video_id}, quality={quality}, message_id={cached_message_id}")
             return cached_message_id
         
-        # 1. Получаем LinkInfo через LinkProcessingService (мозг системы)
         logger.info(f"[worker] Получаю LinkInfo для URL: {url}")
         link_info = link_processor.process_link(url)
         if not link_info:
             logger.error(f"[worker] Не удалось обработать ссылку: {url}")
-            # Публикуем событие об ошибке, чтобы пользователь получил уведомление
             await db.publish_video_download_event(video_id, 'failed')
             return None
         
-        # 2. Получаем DownloadPlan через PlatformService
         logger.info(f"[worker] Получаю DownloadPlan для платформы: {link_info.platform}")
         download_plan = link_info.service.build_download_plan(
             url=link_info.normalized_url,
@@ -126,13 +106,11 @@ async def process_download_task(task: dict) -> Optional[int]:
             logger.error(f"  - Видео приватное или требует авторизацию (Instagram/TikTok)")
             logger.error(f"  - Контент недоступен для определенной аудитории")
             logger.error(f"  - Проблемы с доступом к платформе")
-            # Публикуем событие об ошибке, чтобы пользователь получил уведомление
             await db.publish_video_download_event(video_id, 'failed')
             return None
         
         logger.info(f"[worker] DownloadPlan создан: platform={download_plan.platform}, streamable={download_plan.streamable}")
         
-        # 3. Исполняем DownloadPlan через YtDlpService
         # Стратегия:
         # - Для маленьких файлов (<50MB): скачиваем в память (download_to_stream) - быстрее
         # - Для больших файлов: используем pipelined метод (download_to_file_pipelined) - оптимизированный subprocess
@@ -155,12 +133,6 @@ async def process_download_task(task: dict) -> Optional[int]:
         
         if not result:
             logger.error(f"[worker] ❌ Не удалось скачать видео: url={url}")
-            logger.error(f"[worker] Возможные причины:")
-            logger.error(f"  - Видео недоступно или удалено")
-            logger.error(f"  - Видео приватное (Instagram/TikTok)")
-            logger.error(f"  - Проблемы с сетью или доступом к платформе")
-            logger.error(f"  - yt-dlp не может обработать этот тип контента")
-            # Публикуем событие об ошибке, чтобы пользователь получил уведомление
             await db.publish_video_download_event(video_id, 'failed')
             return None
         
@@ -168,118 +140,83 @@ async def process_download_task(task: dict) -> Optional[int]:
         file_size_mb = file_size / (1024 * 1024)
         logger.info(f"[worker] Размер файла: {file_size_mb:.2f} MB")
         
-        # Определяем, это аудио или видео
-        # Проверяем по download_plan.audio_only и по расширению файла
         audio_extensions = {'.m4a', '.webm', '.opus', '.mp3', '.ogg', '.flac', '.wav', '.m4b'}
         
-        # Получаем расширение из filename или из пути к файлу
         if isinstance(video_data, str):
-            # Если это путь к файлу, берем расширение из пути
             file_ext = os.path.splitext(video_data)[1].lower()
         else:
-            # Если это BytesIO, берем расширение из filename
             file_ext = os.path.splitext(filename)[1].lower()
         
         is_audio = download_plan.audio_only or file_ext in audio_extensions
+        # Тип отправки: из плана (photo/video) или по файлу (audio)
+        send_media_type = 'audio' if is_audio else (download_plan.media_type or 'video')
         
         if is_audio:
             logger.info(f"[worker] Определен тип: audio (расширение: {file_ext}, audio_only: {download_plan.audio_only})")
+        elif send_media_type == 'photo':
+            logger.info(f"[worker] Определен тип: photo (из плана, расширение: {file_ext})")
         else:
             logger.info(f"[worker] Определен тип: video (расширение: {file_ext})")
         
-        # 4. Загружаем в Telegram канал
-        # Для audio-only файлов используем send_audio, для видео - send_video
-        # Для маленьких файлов (<50MB) - используем BufferedInputFile (из памяти)
-        # Для больших файлов - используем FSInputFile (временный файл)
-        # 
-        # ПРИМЕЧАНИЕ: Настоящее streaming (переливание без полного скачивания) невозможно из-за ограничений:
-        # - Telegram Bot API требует полный файл для multipart/form-data upload
-        # - aiogram не поддерживает streaming upload из процесса напрямую
-        # - Нужно знать размер файла заранее для chunked upload
-        # 
-        # Текущая оптимизация: используем pipelined метод для больших файлов, который использует
-        # subprocess напрямую и может быть быстрее, чем yt-dlp Python API
+        # Подпись и опции из плана (сервис формирует описание сообщения для Telegram)
+        caption = getattr(download_plan, 'telegram_caption', None) or f"Source: {url}"
+        parse_mode = getattr(download_plan, 'telegram_parse_mode', None)
+        send_kw = dict(caption=caption)
+        if parse_mode:
+            send_kw['parse_mode'] = parse_mode
+
+        # Сервис задал media_type (video/photo/audio) — отправляем в канал соответствующим методом
+        # Для маленьких файлов (<50MB) — BufferedInputFile, для больших — FSInputFile
         try:
             if isinstance(video_data, io.BytesIO):
-                # Маленький файл в памяти - используем BufferedInputFile
-                logger.info(f"[worker] Загрузка в канал из памяти: {file_size_mb:.2f} MB (тип: {'audio' if is_audio else 'video'})")
-                video_data.seek(0)  # Возвращаемся в начало потока
-                
-                if is_audio:
-                    message = await bot.send_audio(
-                        chat_id=CHANNEL_ID,
-                        audio=types.BufferedInputFile(
-                            file=video_data.read(),
-                            filename=filename
-                        ),
-                        caption=f"Source: {url}"
-                    )
-                else:
-                    message = await bot.send_video(
-                        chat_id=CHANNEL_ID,
-                        video=types.BufferedInputFile(
-                            file=video_data.read(),
-                            filename=filename
-                        ),
-                        caption=f"Source: {url}"
-                    )
+                logger.info(f"[worker] Загрузка в канал из памяти: {file_size_mb:.2f} MB (тип: {send_media_type})")
+                video_data.seek(0)
+                inp = types.BufferedInputFile(file=video_data.read(), filename=filename)
             else:
-                # Большой файл - используем FSInputFile (временный файл)
-                logger.info(f"[worker] Загрузка в канал из файла: {video_data} ({file_size_mb:.2f} MB, тип: {'audio' if is_audio else 'video'})")
-                
-                if is_audio:
-                    message = await bot.send_audio(
-                        chat_id=CHANNEL_ID,
-                        audio=types.FSInputFile(video_data),
-                        caption=f"Source: {url}"
-                    )
-                else:
-                    message = await bot.send_video(
-                        chat_id=CHANNEL_ID,
-                        video=types.FSInputFile(video_data),
-                        caption=f"Source: {url}"
-                    )
+                logger.info(f"[worker] Загрузка в канал из файла: {video_data} ({file_size_mb:.2f} MB, тип: {send_media_type})")
+                inp = types.FSInputFile(video_data)
+
+            if send_media_type == 'audio':
+                message = await bot.send_audio(chat_id=CHANNEL_ID, audio=inp, **send_kw)
+            elif send_media_type == 'photo':
+                message = await bot.send_photo(chat_id=CHANNEL_ID, photo=inp, **send_kw)
+            else:
+                message = await bot.send_video(chat_id=CHANNEL_ID, video=inp, **send_kw)
             
             message_id = message.message_id
         finally:
-            # Очищаем ресурсы
             if isinstance(video_data, io.BytesIO):
                 video_data.close()
             elif isinstance(video_data, str) and os.path.exists(video_data):
-                # Удаляем временный файл после отправки
                 try:
                     os.remove(video_data)
                     logger.info(f"[worker] Временный файл удален: {video_data}")
                 except Exception as e:
                     logger.warning(f"[worker] Не удалось удалить временный файл {video_data}: {e}")
         
-        # 5. Получаем file_id из сообщения (видео или аудио)
         file_id = None
         if message.audio:
             file_id = message.audio.file_id
         elif message.video:
             file_id = message.video.file_id
+        elif message.photo:
+            file_id = message.photo[-1].file_id
         elif message.document:
             file_id = message.document.file_id
         
-        # 6. Сохраняем в кэш с указанием качества (если указано)
         platform = platform or download_plan.platform
-        await db.save_to_cache(video_id, message_id, platform, file_id, original_url=url, quality=quality)
+        await db.save_to_cache(video_id, message_id, platform, file_id, original_url=url, quality=quality, media_type=send_media_type)
         
         logger.info(f"[worker] ✅ Видео успешно скачано и сохранено в кэш: video_id={video_id}, message_id={message_id}")
         
-        # 7. Публикуем событие о завершении скачивания (для wait_for_download)
         await db.publish_video_download_event(video_id, 'completed', message_id, file_id)
         
-        # Публикуем событие DownloadCompletedEvent в очередь аналитики
-        # Примечание: в worker.py нет user_id, поэтому используем 0 (системный)
-        # Реальное событие с user_id будет опубликовано в bot.py после отправки видео пользователю
         try:
             event = DownloadCompletedEvent(
-                user_id=0,  # Системный user_id (worker не знает реального пользователя)
+                user_id=0,
                 video_id=video_id,
                 platform=platform,
-                source='worker'  # Специальный источник для событий от worker
+                source='worker'
             )
             await db.add_analytics_event(event.to_json())
         except Exception as e:
@@ -289,11 +226,9 @@ async def process_download_task(task: dict) -> Optional[int]:
         
     except Exception as e:
         logger.error(f"[worker] Ошибка при обработке задачи: {e}", exc_info=True)
-        # Публикуем событие об ошибке
         await db.publish_video_download_event(video_id, 'failed')
         return None
     finally:
-        # Освобождаем lock (с учетом качества)
         await db.release_download_lock(video_id, quality=quality)
 
 
@@ -306,16 +241,12 @@ async def worker_loop():
     
     while True:
         try:
-            # Получаем задачу из очереди (блокирующее ожидание, timeout 5 секунд)
             task = await db.get_download_task(timeout=5)
             
             if task:
-                # Задача получена - обрабатываем
                 logger.info(f"[worker] Получена задача: video_id={task.get('video_id')}")
                 await process_download_task(task)
             else:
-                # Timeout - нет задач, продолжаем ожидание
-                # Можно добавить небольшую задержку, чтобы не нагружать Redis
                 await asyncio.sleep(0.1)
                 
         except KeyboardInterrupt:
@@ -323,7 +254,6 @@ async def worker_loop():
             break
         except Exception as e:
             logger.error(f"[worker] Ошибка в worker_loop: {e}", exc_info=True)
-            # Небольшая задержка перед повторной попыткой
             await asyncio.sleep(1)
 
 
@@ -334,7 +264,6 @@ async def main():
     except KeyboardInterrupt:
         logger.info("[worker] Получен сигнал остановки")
     finally:
-        # Закрываем соединения
         await db.close()
         await bot.session.close()
         logger.info("[worker] Worker остановлен")

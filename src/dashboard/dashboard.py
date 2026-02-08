@@ -82,7 +82,6 @@ if __name__ == "__main__":
     import sys
     import uvicorn
     
-    # Добавляем корневую директорию в PYTHONPATH для прямого запуска
     import pathlib
     project_root = pathlib.Path(__file__).parent.parent.parent
     if str(project_root) not in sys.path:

@@ -77,6 +77,32 @@ def is_supported_url(url: str) -> bool:
     return any(platform in url_lower for platform in platforms)
 
 
+_SUPPORTED_DOMAINS = [
+    'youtube.com', 'youtu.be',
+    'instagram.com',
+    'tiktok.com',
+]
+
+
+def ensure_url_protocol(text: str) -> tuple[str, bool]:
+    """
+    Проверяет и добавляет протокол к URL, если его нет.
+
+    Args:
+        text: Текст, который может быть URL.
+
+    Returns:
+        Tuple (обработанный текст, True если это валидный URL, False если нет).
+    """
+    if text.startswith(('http://', 'https://')):
+        return text, True
+    text_lower = text.lower().replace('www.', '')
+    is_likely_url = any(domain in text_lower for domain in _SUPPORTED_DOMAINS)
+    if is_likely_url:
+        return f"https://{text.strip()}", True
+    return text, False
+
+
 def is_youtube_shorts(url: str) -> bool:
     """
     Проверка, является ли URL ссылкой на YouTube Shorts.

@@ -14,12 +14,10 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Типы источников скачивания
 DOWNLOAD_SOURCE_MESSAGE = 'message'
 DOWNLOAD_SOURCE_INLINE = 'inline'
 DOWNLOAD_SOURCE_DEEP_LINK = 'deep_link'
 
-# Типы событий кликов
 CLICK_EVENT_BUTTON = 'button_click'
 CLICK_EVENT_DEEP_LINK = 'deep_link'
 
@@ -35,10 +33,8 @@ class AnalyticsDB:
             database_url: URL для подключения к PostgreSQL (по умолчанию из .env)
         """
         if not database_url:
-            # Сначала проверяем полный URL
             database_url = os.getenv("DATABASE_URL")
             if not database_url:
-                # Если нет полного URL, собираем из отдельных переменных
                 postgres_host = os.getenv("POSTGRES_HOST", "localhost")
                 postgres_port = os.getenv("POSTGRES_PORT", "5432")
                 postgres_db = os.getenv("POSTGRES_DB", "analytics")
@@ -76,7 +72,6 @@ class AnalyticsDB:
             await self.connect()
         
         async with self.pool.acquire() as conn:
-            # Таблица users
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -91,7 +86,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Таблица videos
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     video_id VARCHAR(255) PRIMARY KEY,
@@ -104,7 +98,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Таблица downloads
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS downloads (
                     id SERIAL PRIMARY KEY,
@@ -116,7 +109,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Таблица referrals
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS referrals (
                     id SERIAL PRIMARY KEY,
@@ -127,7 +119,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Таблица click_events
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS click_events (
                     id SERIAL PRIMARY KEY,
@@ -138,7 +129,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Таблица ad_campaigns (заготовка для рекламы)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ad_campaigns (
                     id SERIAL PRIMARY KEY,
@@ -153,7 +143,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Таблица ad_impressions (логирование показов рекламы)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ad_impressions (
                     id SERIAL PRIMARY KEY,
@@ -164,7 +153,6 @@ class AnalyticsDB:
                 )
             """)
             
-            # Индексы для производительности
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_user_id ON downloads(user_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_video_id ON downloads(video_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at)")
@@ -219,7 +207,6 @@ class AnalyticsDB:
         
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # Обновляем/создаём пользователя
                 await conn.execute("""
                     INSERT INTO users (user_id, last_seen_at)
                     VALUES ($1, NOW())
@@ -260,7 +247,6 @@ class AnalyticsDB:
             await self.connect()
         
         async with self.pool.acquire() as conn:
-            # Создаём пользователя, если его нет
             await conn.execute("""
                 INSERT INTO users (user_id, last_seen_at)
                 VALUES ($1, NOW())
@@ -291,8 +277,7 @@ class AnalyticsDB:
                 VALUES ($1, $2)
                 ON CONFLICT (referrer_id, referred_user_id) DO NOTHING
             """, referrer_id, referred_user_id)
-            
-            # Обновляем referred_by у нового пользователя
+
             await conn.execute("""
                 UPDATE users
                 SET referred_by = $1
@@ -406,7 +391,6 @@ class AnalyticsDB:
             await self.connect()
         
         async with self.pool.acquire() as conn:
-            # Используем безопасный параметр для INTERVAL
             interval_str = f"{days} days"
             count = await conn.fetchval(
                 "SELECT COUNT(DISTINCT user_id) "

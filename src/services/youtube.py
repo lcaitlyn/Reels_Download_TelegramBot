@@ -4,57 +4,196 @@
 Знает только YouTube, формирует DownloadPlan
 """
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from src.models.download_plan import DownloadPlan
+from src.config import get_youtube_shorts_quality_order, get_youtube_quality_heights, get_max_file_size_mb
 from .base import BaseService
 
 logger = logging.getLogger(__name__)
 
-
 class YouTubeService(BaseService):
     """
     Сервис для работы с YouTube видео
-    
-    Знает:
-    - Форматы YouTube
-    - Выбор качества
-    - Опции yt-dlp для YouTube
-    
-    НЕ знает:
-    - Redis
-    - Telegram
-    - Пользователей
-    - Очереди
     """
     
     def can_handle(self, url: str) -> bool:
-        """Может ли сервис обработать этот URL"""
-        return 'youtube.com' in url.lower() or 'youtu.be' in url.lower()
-    
+        return "youtube.com" in url.lower() or "youtu.be" in url.lower()
+
+    def needs_pre_download_choice(self, url: str, query_text: Optional[str] = None) -> bool:
+        """Для YouTube — показывать выбор качества только для обычных видео, не для Shorts."""
+        if not self.can_handle(url):
+            return False
+        text = (query_text or url).lower()
+        return "shorts" not in text
+
     @staticmethod
     def _is_shorts_url(url: str) -> bool:
-        """Shorts: вертикальное видео 9:16 (720x1280, 1080x1920)."""
-        return 'shorts' in url.lower()
-    
+        return "shorts" in url.lower()
+
+    def _get_best_shorts_format_id(self, url: str) -> Optional[str]:
+        """
+        Returns:
+            Лучший format_id для Shorts
+        """
+        quality_order = get_youtube_shorts_quality_order()
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'listformats': True,
+        }
+        info = self.downloader.get_info(url, ydl_opts)
+        if not info:
+            return None
+        formats = info.get('formats', [])
+        muxed = [
+            f for f in formats
+            if isinstance(f, dict)
+            and (f.get('vcodec') or 'none') != 'none'
+            and (f.get('acodec') or 'none') != 'none'
+        ]
+        if not muxed:
+            logger.info("[YouTube] Shorts: нет форматов с видео+аудио, fallback на height-селектор")
+            return None
+
+        def priority_key(fmt: Dict[str, Any]) -> tuple:
+            note = (fmt.get('format_note') or '').strip()
+            prio = next(
+                (i for i, q in enumerate(quality_order) if q in note or note == q or note.startswith(q)),
+                len(quality_order),
+            )
+            height = fmt.get('height') or 0
+            return (prio, -height)
+
+        muxed.sort(key=priority_key)
+        best = muxed[0]
+        fid = best.get('format_id')
+        logger.info(
+            f"[YouTube] Shorts: выбран формат {fid} "
+            f"(format_note={best.get('format_note')}, height={best.get('height')})"
+        )
+        return fid
+
     def extract_video_id(self, url: str) -> Optional[str]:
         """Извлечь канонический ID видео YouTube"""
         return self.downloader.get_video_id(url)
-    
+
+    def get_ydl_opts(self) -> Dict[str, Any]:
+        """
+        Опции yt-dlp для одного get_info (форматы + метаданные без скачивания).
+        """
+        return {
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'extract_flat': False,
+            'listformats': True,
+        }
+
+    def parse_info_for_quality_selection(
+        self, info: Dict[str, Any]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Из одного ответа get_info получить словарь форматов (1080p/720p/480p/audio -> format_id)
+        и метаданные для превью. Только форматы с аудио (muxed).
+        Качества и лимит размера берутся из конфига (YOUTUBE_QUALITY_HEIGHTS, MAX_FILE_SIZE_MB).
+
+        Returns:
+            (formats_dict, metadata_dict)
+            formats_dict: {'1080p': {'format_id': '...', 'filesize': ..., 'ext': ...}, ...}
+            metadata_dict: {'title': ..., 'thumbnail': ..., 'fulltitle': ...}
+        """
+        if not info:
+            return None, None
+        max_bytes = int(get_max_file_size_mb() * 1024 * 1024)
+        formats_list = info.get('formats') or []
+        muxed = [
+            f for f in formats_list
+            if isinstance(f, dict)
+            and (f.get('vcodec') or 'none') != 'none'
+            and (f.get('acodec') or 'none') != 'none'
+        ]
+        formats_dict: Dict[str, Any] = {}
+        quality_heights = get_youtube_quality_heights()
+        for heights, label in quality_heights:
+            heights_list = [heights] if isinstance(heights, int) else list(heights)
+            candidates = [
+                f for f in muxed
+                if (f.get('height') or 0) in heights_list
+            ]
+            if not candidates:
+                continue
+            best = min(
+                candidates,
+                key=lambda x: x.get('filesize') or x.get('filesize_approx') or float('inf')
+            )
+            filesize = best.get('filesize') or best.get('filesize_approx') or 0
+            if filesize and filesize > max_bytes:
+                continue
+            fid = best.get('format_id')
+            if fid and label not in formats_dict:
+                formats_dict[label] = {
+                    'format_id': fid,
+                    'filesize': filesize,
+                    'ext': best.get('ext', 'mp4'),
+                    'height': best.get('height'),
+                }
+        # Audio-only
+        audio_formats = [
+            f for f in formats_list
+            if isinstance(f, dict)
+            and (f.get('vcodec') or 'none') == 'none'
+            and (f.get('acodec') or 'none') != 'none'
+            and (f.get('ext') or '') in ('m4a', 'webm', 'mp3', 'opus')
+        ]
+        if audio_formats:
+            best_audio = max(
+                audio_formats,
+                key=lambda x: x.get('filesize') or x.get('filesize_approx') or 0
+            )
+            audio_size = best_audio.get('filesize') or best_audio.get('filesize_approx') or 0
+            if not audio_size or audio_size <= max_bytes:
+                fid = best_audio.get('format_id')
+                if fid:
+                    formats_dict['audio'] = {
+                        'format_id': fid,
+                        'filesize': audio_size,
+                        'ext': best_audio.get('ext', 'm4a'),
+                    }
+        metadata = {
+            'title': info.get('title') or info.get('fulltitle'),
+            'thumbnail': info.get('thumbnail'),
+            'fulltitle': info.get('fulltitle') or info.get('title'),
+        }
+        if not metadata.get('thumbnail') and info.get('thumbnails'):
+            thumbnails = info.get('thumbnails') or []
+            if thumbnails:
+                last = thumbnails[-1]
+                if isinstance(last, dict):
+                    metadata['thumbnail'] = last.get('url')
+                elif isinstance(last, str):
+                    metadata['thumbnail'] = last
+        return (formats_dict if formats_dict else None, metadata)
+
     def get_metadata(self, url: str) -> Optional[Dict[str, Any]]:
         """
-        Получить метаданные видео YouTube
-        
-        Args:
-            url: URL видео
-            
-        Returns:
-            Словарь с метаданными (id, duration, filesize, ext, etc.) или None
+        Получить метаданные видео YouTube (один запрос get_info с get_ydl_opts).
         """
-        return self.downloader.get_video_info(url)
-    
+        opts = self.get_ydl_opts()
+        info = self.downloader.get_info(url, opts)
+        if not info:
+            return None
+        _, metadata = self.parse_info_for_quality_selection(info)
+        return metadata
+
     def get_available_formats(self, url: str) -> Optional[Dict[str, Any]]:
-        """Получить доступные форматы для YouTube видео"""
-        return self.downloader.get_available_formats(url)
+        """Получить доступные форматы для YouTube видео (один запрос get_info с get_ydl_opts)."""
+        opts = self.get_ydl_opts()
+        info = self.downloader.get_info(url, opts)
+        if not info:
+            return None
+        formats_dict, _ = self.parse_info_for_quality_selection(info)
+        return formats_dict
     
     def build_download_plan(
         self,
@@ -64,9 +203,6 @@ class YouTubeService(BaseService):
     ) -> Optional[DownloadPlan]:
         """
         Построить план скачивания для YouTube
-        
-        ОПТИМИЗАЦИЯ: Не получаем метаданные здесь - это блокирует event loop.
-        Метаданные будут получены во время скачивания через yt-dlp.
         
         Args:
             url: URL видео YouTube
@@ -82,8 +218,10 @@ class YouTubeService(BaseService):
             logger.error("[YouTube] Не удалось извлечь video_id из URL")
             return None
         
-        # Определяем формат (для Shorts — вертикальное 9:16: 720x1280 → 480x854 → 360, без выбора качества)
+        # Определяем формат (для Shorts — приоритет по format_note и только с аудио)
         is_shorts = self._is_shorts_url(url) or quality == 'shorts'
+        if is_shorts and not format_id:
+            format_id = self._get_best_shorts_format_id(url)
         format_selector = self._prepare_format_selector(format_id, quality, is_shorts=is_shorts)
         
         # Формируем опции yt-dlp для YouTube
@@ -94,6 +232,8 @@ class YouTubeService(BaseService):
         
         # Определяем, только ли аудио
         audio_only = quality == 'audio' if quality else False
+        media_type = 'audio' if audio_only else 'video'
+        telegram_caption = f"Source: {url}"
         
         return DownloadPlan(
             platform='youtube',
@@ -103,6 +243,8 @@ class YouTubeService(BaseService):
             quality=quality,
             audio_only=audio_only,
             streamable=streamable,
+            media_type=media_type,
+            telegram_caption=telegram_caption,
             ydl_opts=ydl_opts,
             metadata=None  # Метаданные будут получены во время скачивания
         )
@@ -119,12 +261,15 @@ class YouTubeService(BaseService):
         Shorts (9:16): один уже сведённый формат (без мержа), чтобы качать без ffmpeg.
         Приоритет: 720x1280 → 480x854 → 360 (один поток mp4/m3u8 с видео+звуком).
         """
-        # Shorts: один формат (без bestvideo+bestaudio), без ffmpeg. Лучший готовый поток до 1280.
+        # Shorts: если уже выбран format_id (muxed по приоритету format_note) — используем его
         if is_shorts:
+            if format_id:
+                return format_id
+            # Fallback: по высоте (один поток без мержа)
             if quality == '1080p':
                 return 'best[height<=1920][ext=mp4]/best[height<=1920]'
             return 'best[height<=1280][ext=mp4]/best[height<=1280]/best[height<=854]/best'
-        
+
         # Обычное видео (16:9): при выборе 480p/720p/1080p ВСЕГДА селектор по качеству, НЕ format_id.
         # (92, 93, 94, 300 и т.д. — HLS, при -f 300 дают "The downloaded file is empty".)
         if quality in ('480p', '720p', '1080p'):
@@ -174,11 +319,3 @@ class YouTubeService(BaseService):
             'writethumbnail': False,
         }
     
-    # Методы для обратной совместимости (будут удалены)
-    def get_video_id(self, url: str) -> Optional[str]:
-        """DEPRECATED: Используйте extract_video_id()"""
-        return self.extract_video_id(url)
-    
-    def get_default_format(self) -> str:
-        """Формат по умолчанию для YouTube (для Shorts) — видео со звуком"""
-        return 'bestvideo[height<=360][ext=mp4]+bestaudio/best'

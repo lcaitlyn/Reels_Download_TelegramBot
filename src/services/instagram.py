@@ -5,7 +5,9 @@
 """
 import logging
 import os
+import re
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 from src.models.download_plan import DownloadPlan
 from .base import BaseService
 
@@ -13,29 +15,64 @@ logger = logging.getLogger(__name__)
 
 
 class InstagramService(BaseService):
-    """
-    Сервис для работы с Instagram видео
-    
-    Знает:
-    - Форматы Instagram
-    - Опции yt-dlp для Instagram
-    - Ограничения Instagram
-    
-    НЕ знает:
-    - Redis
-    - Telegram
-    - Пользователей
-    - Очереди
-    """
+
+    _SHORTCODE_PATTERN = re.compile(
+        r'/(?:reels?|p|tv)/([A-Za-z0-9_-]{10,})',
+        re.IGNORECASE
+    )
     
     def can_handle(self, url: str) -> bool:
         """Может ли сервис обработать этот URL"""
         return 'instagram.com' in url.lower()
+
     
+
+    def get_video_id(self, url: str) -> Optional[str]:
+        """
+        Returns:
+            Строка вида "instagram:shortcode" или None.
+        """
+        shortcode = self._parse_shortcode_from_url(url)
+        if shortcode:
+            return f"instagram:{shortcode}"
+        return None
+
     def extract_video_id(self, url: str) -> Optional[str]:
-        """Извлечь канонический ID видео Instagram"""
-        return self.downloader.get_video_id(url)
-    
+        return self._parse_shortcode_from_url(url)
+
+    def _parse_shortcode_from_url(self, url: str) -> Optional[str]:
+        if not url or 'instagram.com' not in url.lower():
+            return None
+        try:
+            parsed = urlparse(url)
+            path = (parsed.path or '').rstrip('/')
+            match = self._SHORTCODE_PATTERN.search(path)
+            if match:
+                return match.group(1)
+        except Exception as e:
+            logger.debug("Ошибка парсинга URL Instagram %s: %s", url, e)
+        return None
+
+    def get_media_type(self, url: str) -> str:
+        """
+        Тип контента по URL: посты /p/ — фото, рилсы и IGTV — видео.
+        Returns: 'photo' | 'video'
+        """
+        if not url or 'instagram.com' not in url.lower():
+            return 'video'
+        try:
+            parsed = urlparse(url)
+            path = (parsed.path or '').rstrip('/').lower()
+            if '/p/' in path:
+                return 'photo'
+        except Exception:
+            pass
+        return 'video'
+
+    def get_ydl_opts(self) -> Dict[str, Any]:
+        """Опции yt-dlp для get_info (только информация)."""
+        return self._get_info_opts_for_instagram()
+
     def get_metadata(self, url: str) -> Optional[Dict[str, Any]]:
         """
         Получить метаданные видео Instagram
@@ -83,6 +120,8 @@ class InstagramService(BaseService):
         # По умолчанию считаем, что можно стримить (для маленьких файлов)
         # Если файл окажется большим, worker переключится на файловый режим
         streamable = True  # Будет переопределено во время скачивания
+        media_type = self.get_media_type(url)
+        telegram_caption = f"Source: {url}"
         
         return DownloadPlan(
             platform='instagram',
@@ -90,6 +129,8 @@ class InstagramService(BaseService):
             url=url,
             format_selector=format_selector,
             streamable=streamable,
+            media_type=media_type,
+            telegram_caption=telegram_caption,
             ydl_opts=ydl_opts,
             metadata=None  # Метаданные будут получены во время скачивания
         )
@@ -188,15 +229,3 @@ class InstagramService(BaseService):
 
         return None
     
-    # Методы для обратной совместимости (будут удалены)
-    def get_video_id(self, url: str) -> Optional[str]:
-        """DEPRECATED: Используйте extract_video_id()"""
-        return self.extract_video_id(url)
-    
-    def get_available_formats(self, url: str) -> Optional[Dict[str, Any]]:
-        """Instagram не поддерживает выбор качества"""
-        return None
-    
-    def get_default_format(self) -> str:
-        """Формат по умолчанию для Instagram"""
-        return 'best[ext=mp4]/best'

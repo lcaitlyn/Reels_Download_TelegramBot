@@ -9,6 +9,7 @@ from src.utils.utils import normalize_url, is_supported_url, get_video_id_fast, 
 logger = logging.getLogger(__name__)
 
 
+# TODO пизда как-тут вообще че и как используется
 class HandleInlineQueryUseCase:
     """Use case для обработки inline-запросов"""
     
@@ -47,18 +48,15 @@ class HandleInlineQueryUseCase:
         """
         query = query.strip()
         
-        # Если запрос пустой - показываем подсказку
         if not query:
             return {
                 'type': 'help',
                 'results': []
             }
         
-        # Если запрос похож на URL
         if query.startswith(('http://', 'https://')):
             normalized_url = normalize_url(query)
             
-            # Проверяем, поддерживается ли платформа
             if not is_supported_url(normalized_url):
                 return {
                     'type': 'unsupported',
@@ -66,7 +64,7 @@ class HandleInlineQueryUseCase:
                 }
             
             platform = get_platform(normalized_url)
-            # Сначала пытаемся получить video_id быстрым способом
+            
             video_id, normalized_url = get_video_id_fast(query)
             
             # Для YouTube видео (не Shorts) - особая логика
@@ -90,10 +88,12 @@ class HandleInlineQueryUseCase:
         if best_quality_result:
             # Видео есть в кэше - отправляем лучшее качество
             quality_label, cached_file_id = best_quality_result
+            media_type = await self.db.get_cached_media_type(video_id=video_id, quality=quality_label) or 'video'
             return {
                 'type': 'cached',
                 'results': [{
-                    'type': 'cached_video',
+                    'type': 'cached_media',
+                    'media_type': media_type,
                     'file_id': cached_file_id,
                     'title': f"✅ Видео из кэша ({platform}, {quality_label})",
                     'description': url
@@ -142,15 +142,15 @@ class HandleInlineQueryUseCase:
     async def _handle_other_platforms(self, url: str, video_id: Optional[str], platform: str, bot) -> dict:
         """Обработка других платформ (TikTok, Instagram, Shorts)"""
         cached_file_id = await self.db.get_cached_file_id(video_id=video_id, url=url)
-        
         if cached_file_id:
-            # Видео найдено в кэше
+            media_type = await self.db.get_cached_media_type(video_id=video_id, url=url) or 'video'
             return {
                 'type': 'cached',
                 'results': [{
-                    'type': 'cached_video',
+                    'type': 'cached_media',
+                    'media_type': media_type,
                     'file_id': cached_file_id,
-                    'title': f"✅ Видео из кэша ({platform})",
+                    'title': f"✅ Из кэша ({platform})",
                     'description': url
                 }]
             }

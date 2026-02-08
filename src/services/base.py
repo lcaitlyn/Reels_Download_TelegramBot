@@ -16,12 +16,7 @@ class BaseService(ABC):
     НЕ скачивает видео, НЕ работает с Redis, НЕ работает с Telegram.
     """
     
-    def __init__(self, downloader):
-        """
-        Args:
-            downloader: Экземпляр VideoDownloader для получения информации о видео
-        """
-        self.downloader = downloader
+    def __init__(self):
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
     
     @abstractmethod
@@ -38,7 +33,7 @@ class BaseService(ABC):
         pass
     
     @abstractmethod
-    def extract_video_id(self, url: str) -> Optional[str]:
+    def get_video_id(self, url: str) -> Optional[str]:
         """
         Извлечь канонический video_id
         
@@ -50,6 +45,20 @@ class BaseService(ABC):
         """
         pass
     
+    def get_ydl_opts(self) -> Dict[str, Any]:
+        """
+        Опции yt-dlp для get_info (только информация, без скачивания).
+        Переопределяется в сервисах платформ (YouTube, Instagram, TikTok).
+        """
+        return {}
+
+    def needs_pre_download_choice(self, url: str, query_text: Optional[str] = None) -> bool:
+        """
+        Нужен ли выбор пользователя перед скачиванием (качество, подтверждение и т.д.).
+        Переопределяется в сервисах, где есть такой шаг (например YouTube — выбор качества).
+        """
+        return False
+
     @abstractmethod
     def get_metadata(self, url: str) -> Optional[Dict[str, Any]]:
         """
@@ -82,28 +91,3 @@ class BaseService(ABC):
             DownloadPlan или None при ошибке
         """
         pass
-    
-    # Методы для обратной совместимости (будут удалены после полного рефакторинга)
-    def get_video_id(self, url: str) -> Optional[str]:
-        """
-        DEPRECATED: Используйте extract_video_id()
-        """
-        return self.extract_video_id(url)
-    
-    def get_available_formats(self, url: str) -> Optional[Dict[str, Any]]:
-        """
-        DEPRECATED: Будет удален или перенесен в специфичные сервисы
-        """
-        return None
-    
-    def get_default_format(self) -> str:
-        """
-        DEPRECATED: Используйте build_download_plan()
-        """
-        return 'best[ext=mp4]/best'
-    
-    def download_video(self, url: str, format_id: Optional[str] = None) -> Optional[tuple]:
-        """
-        DEPRECATED: Будет удален. Скачивание теперь делает Worker через YtDlpService
-        """
-        raise NotImplementedError("download_video() удален. Используйте build_download_plan()")

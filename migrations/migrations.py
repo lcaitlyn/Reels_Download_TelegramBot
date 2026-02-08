@@ -16,25 +16,21 @@ logger = logging.getLogger(__name__)
 
 
 async def create_database_if_not_exists():
-    """Создать базу данных, если она не существует"""
-    # Получаем параметры подключения
     postgres_host = os.getenv("POSTGRES_HOST", "localhost")
     postgres_port = int(os.getenv("POSTGRES_PORT", "5432"))
     postgres_db = os.getenv("POSTGRES_DB", "analytics")
     postgres_user = os.getenv("POSTGRES_USER", "postgres")
     postgres_password = os.getenv("POSTGRES_PASSWORD", "postgres")
     
-    # Подключаемся к postgres БД (системная БД) для создания analytics
     try:
         conn = await asyncpg.connect(
             host=postgres_host,
             port=postgres_port,
             user=postgres_user,
             password=postgres_password,
-            database='postgres'  # Подключаемся к системной БД
+            database='postgres'
         )
         
-        # Проверяем, существует ли база данных
         exists = await conn.fetchval(
             "SELECT 1 FROM pg_database WHERE datname = $1", postgres_db
         )
@@ -53,8 +49,6 @@ async def create_database_if_not_exists():
 
 
 async def run_migrations():
-    """Запустить миграции БД"""
-    # Сначала создаем базу данных, если её нет
     try:
         await create_database_if_not_exists()
     except Exception as e:

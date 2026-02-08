@@ -11,6 +11,7 @@ from src.events.events import VideoViewClickedEvent
 logger = logging.getLogger(__name__)
 
 
+# TODO отрефакторить
 class HandleStartUseCase:
     """Use case для обработки команды /start"""
     
