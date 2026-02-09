@@ -6,6 +6,8 @@
 import logging
 import os
 import re
+import shutil
+import tempfile
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 from src.models.download_plan import DownloadPlan
@@ -211,21 +213,42 @@ class InstagramService(BaseService):
         Приоритет:
         1) переменная окружения INSTAGRAM_COOKIES_FILE
         2) файл репозитория cookies/cookies.txt (если существует)
+        
+        ВАЖНО: yt-dlp пытается сохранять cookies обратно в этот файл.
+        В docker-окружении путь внутри /app может быть только для чтения,
+        поэтому при необходимости копируем cookies во временную, доступную для записи директорию.
         """
-        # 1. Переменная окружения (используется в docker-compose.prod)
-        cookiefile = os.getenv('INSTAGRAM_COOKIES_FILE')
-        if cookiefile:
-            return cookiefile
+        def _ensure_writable_copy(path: str) -> Optional[str]:
+            try:
+                if not os.path.exists(path):
+                    return None
 
-        # 2. Файл в репозитории: ./cookies/cookies.txt
+                if os.access(path, os.W_OK):
+                    return path
+
+                tmp_dir = tempfile.gettempdir()
+                tmp_path = os.path.join(tmp_dir, 'instagram_cookies.txt')
+                shutil.copy2(path, tmp_path)
+                return tmp_path
+            except Exception as e:
+                logger.warning("Не удалось подготовить cookies-файл для Instagram: %s", e)
+                return None
+
+
+        env_cookiefile = os.getenv('INSTAGRAM_COOKIES_FILE')
+        if env_cookiefile:
+            writable_env = _ensure_writable_copy(env_cookiefile)
+            if writable_env:
+                return writable_env
+
         try:
-            # instagram.py лежит в src/services/, нужно подняться на два уровня до корня проекта
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
             default_path = os.path.join(base_dir, 'cookies', 'cookies.txt')
-            if os.path.exists(default_path):
-                return default_path
-        except Exception:
-            pass
+            writable_default = _ensure_writable_copy(default_path)
+            if writable_default:
+                return writable_default
+        except Exception as e:
+            logger.warning("Не удалось определить путь к cookies/cookies.txt: %s", e)
 
         return None
     
