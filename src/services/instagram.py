@@ -57,18 +57,16 @@ class InstagramService(BaseService):
 
     def get_media_type(self, url: str) -> str:
         """
-        Тип контента по URL: посты /p/ — фото, рилсы и IGTV — видео.
-        Returns: 'photo' | 'video'
+        Определение типа контента по URL.
+
+        Раньше посты `/p/` принудительно считались фото, из‑за чего видео‑посты
+        и рилсы, отданные Instagram как `/p/…`, отправлялись в Telegram как фото.
+        Пока отдельной обработки чисто фото‑постов нет (см. TODO в обработчике),
+        поэтому считаем весь Instagram‑контент видео и пусть воркер решает,
+        как именно его скачать/отправить.
+
+        Returns: всегда 'video'
         """
-        if not url or 'instagram.com' not in url.lower():
-            return 'video'
-        try:
-            parsed = urlparse(url)
-            path = (parsed.path or '').rstrip('/').lower()
-            if '/p/' in path:
-                return 'photo'
-        except Exception:
-            pass
         return 'video'
 
     def get_ydl_opts(self) -> Dict[str, Any]:

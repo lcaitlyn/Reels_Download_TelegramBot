@@ -42,7 +42,7 @@ service_factory = ServiceFactory(downloader)
 link_processor = LinkProcessingService(service_factory)
 ytdlp_service = YtDlpService()
 
-
+# TODO сделать рефактор функции на более читаемый код
 async def process_download_task(task: dict) -> Optional[int]:
     """
     Worker - тупой исполнитель
@@ -141,6 +141,7 @@ async def process_download_task(task: dict) -> Optional[int]:
         logger.info(f"[worker] Размер файла: {file_size_mb:.2f} MB")
         
         audio_extensions = {'.m4a', '.webm', '.opus', '.mp3', '.ogg', '.flac', '.wav', '.m4b'}
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
         
         if isinstance(video_data, str):
             file_ext = os.path.splitext(video_data)[1].lower()
@@ -148,13 +149,23 @@ async def process_download_task(task: dict) -> Optional[int]:
             file_ext = os.path.splitext(filename)[1].lower()
         
         is_audio = download_plan.audio_only or file_ext in audio_extensions
-        # Тип отправки: из плана (photo/video) или по файлу (audio)
-        send_media_type = 'audio' if is_audio else (download_plan.media_type or 'video')
+        is_photo = (not is_audio) and file_ext in image_extensions
+        
+        # Тип отправки:
+        # - audio: по флагу audio_only или аудио‑расширению файла
+        # - photo: если итоговый файл — изображение (решение по факту работы yt-dlp)
+        # - иначе: video (по плану или по умолчанию)
+        if is_audio:
+            send_media_type = 'audio'
+        elif is_photo:
+            send_media_type = 'photo'
+        else:
+            send_media_type = download_plan.media_type or 'video'
         
         if is_audio:
             logger.info(f"[worker] Определен тип: audio (расширение: {file_ext}, audio_only: {download_plan.audio_only})")
-        elif send_media_type == 'photo':
-            logger.info(f"[worker] Определен тип: photo (из плана, расширение: {file_ext})")
+        elif is_photo:
+            logger.info(f"[worker] Определен тип: photo (по расширению файла: {file_ext})")
         else:
             logger.info(f"[worker] Определен тип: video (расширение: {file_ext})")
         
