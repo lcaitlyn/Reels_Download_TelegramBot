@@ -66,7 +66,7 @@ try:
 except ValueError:
     pass
 
-HELLO_GIF_PATH = Path(__file__).resolve().parent.parent / "src" / "resources" / "hello.gif"
+HELLO_GIF_PATH = Path(__file__).resolve().parent.parent / "resources" / "hello.gif"
 
 session = AiohttpSession(timeout=600)
 bot = Bot(token=BOT_TOKEN, session=session)

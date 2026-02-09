@@ -17,7 +17,7 @@ from src.models.download_plan import DownloadPlan
 
 logger = logging.getLogger(__name__)
 
-
+# TODO требуется рефактор
 class YtDlpService:
     """
     Низкоуровневый сервис для работы с yt-dlp

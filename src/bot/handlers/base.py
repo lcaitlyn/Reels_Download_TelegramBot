@@ -5,6 +5,7 @@ from typing import Callable, Awaitable, Any
 from src.models.link_info import LinkInfo
 
 
+# TODO переименовать всё на handeler_{service}
 @dataclass
 class HandlerContext:
     message: Any

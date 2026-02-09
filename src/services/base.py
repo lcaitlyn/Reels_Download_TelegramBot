@@ -16,8 +16,14 @@ class BaseService(ABC):
     НЕ скачивает видео, НЕ работает с Redis, НЕ работает с Telegram.
     """
     
-    def __init__(self):
+    def __init__(self, downloader):
+        """
+        Args:
+            downloader: Объект, предоставляющий методы работы с yt-dlp
+                       (YtDlpService или совместимый по интерфейсу)
+        """
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self.downloader = downloader
     
     @abstractmethod
     def can_handle(self, url: str) -> bool:
