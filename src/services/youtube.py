@@ -31,10 +31,6 @@ class YouTubeService(BaseService):
         return "shorts" in url.lower()
 
     def _get_best_shorts_format_id(self, url: str) -> Optional[str]:
-        """
-        Returns:
-            Лучший format_id для Shorts
-        """
         quality_order = get_youtube_shorts_quality_order()
         ydl_opts = {
             'quiet': True,
@@ -74,8 +70,7 @@ class YouTubeService(BaseService):
         )
         return fid
 
-    def extract_video_id(self, url: str) -> Optional[str]:
-        """Извлечь канонический ID видео YouTube"""
+    def get_video_id(self, url: str) -> Optional[str]:
         return self.downloader.get_video_id(url)
 
     def get_ydl_opts(self) -> Dict[str, Any]:
@@ -176,9 +171,6 @@ class YouTubeService(BaseService):
         return (formats_dict if formats_dict else None, metadata)
 
     def get_metadata(self, url: str) -> Optional[Dict[str, Any]]:
-        """
-        Получить метаданные видео YouTube (один запрос get_info с get_ydl_opts).
-        """
         opts = self.get_ydl_opts()
         info = self.downloader.get_info(url, opts)
         if not info:
@@ -187,7 +179,6 @@ class YouTubeService(BaseService):
         return metadata
 
     def get_available_formats(self, url: str) -> Optional[Dict[str, Any]]:
-        """Получить доступные форматы для YouTube видео (один запрос get_info с get_ydl_opts)."""
         opts = self.get_ydl_opts()
         info = self.downloader.get_info(url, opts)
         if not info:
@@ -195,6 +186,7 @@ class YouTubeService(BaseService):
         formats_dict, _ = self.parse_info_for_quality_selection(info)
         return formats_dict
     
+    # TODO требуется рефактор
     def build_download_plan(
         self,
         url: str,
@@ -212,25 +204,20 @@ class YouTubeService(BaseService):
         Returns:
             DownloadPlan или None при ошибке
         """
-        # Извлекаем video_id из URL (быстро, без запросов к API)
-        video_id = self.extract_video_id(url)
+        video_id = self.get_video_id(url)
         if not video_id:
             logger.error("[YouTube] Не удалось извлечь video_id из URL")
             return None
         
-        # Определяем формат (для Shorts — приоритет по format_note и только с аудио)
         is_shorts = self._is_shorts_url(url) or quality == 'shorts'
         if is_shorts and not format_id:
             format_id = self._get_best_shorts_format_id(url)
         format_selector = self._prepare_format_selector(format_id, quality, is_shorts=is_shorts)
         
-        # Формируем опции yt-dlp для YouTube
         ydl_opts = self._get_ydl_opts_for_youtube(format_selector)
         
-        # Shorts часто идут как HLS (m3u8) — в stdout дают 0 байт, стрим не годится. Качаем только в файл.
         streamable = not is_shorts
         
-        # Определяем, только ли аудио
         audio_only = quality == 'audio' if quality else False
         media_type = 'audio' if audio_only else 'video'
         telegram_caption = f"Source: {url}"
@@ -246,9 +233,10 @@ class YouTubeService(BaseService):
             media_type=media_type,
             telegram_caption=telegram_caption,
             ydl_opts=ydl_opts,
-            metadata=None  # Метаданные будут получены во время скачивания
+            metadata=None
         )
     
+    # TODO нахуй он вообще нужен если я уже делаю по format_id закачку?
     def _prepare_format_selector(
         self,
         format_id: Optional[str],

@@ -27,15 +27,12 @@ class TikTokService(BaseService):
     """
     
     def can_handle(self, url: str) -> bool:
-        """Может ли сервис обработать этот URL"""
         return 'tiktok.com' in url.lower()
     
-    def extract_video_id(self, url: str) -> Optional[str]:
-        """Извлечь канонический ID видео TikTok"""
+    def get_video_id(self, url: str) -> Optional[str]:
         return self.downloader.get_video_id(url)
 
     def get_ydl_opts(self) -> Dict[str, Any]:
-        """Опции yt-dlp для get_info (только информация)."""
         return {'quiet': True, 'no_warnings': True, 'extract_flat': False}
 
     def get_metadata(self, url: str) -> Optional[Dict[str, Any]]:
@@ -71,7 +68,7 @@ class TikTokService(BaseService):
             DownloadPlan или None при ошибке
         """
         # Извлекаем video_id из URL (быстро, без запросов к API)
-        video_id = self.extract_video_id(url)
+        video_id = self.get_video_id(url)
         if not video_id:
             logger.error("[TikTok] Не удалось извлечь video_id из URL")
             return None
